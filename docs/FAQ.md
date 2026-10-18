@@ -54,7 +54,7 @@ correlation IDs — see [correlation-ids.md](correlation-ids.md).
 
 **How do I run Soroban Pulse locally?**
 See [development-setup.md](development-setup.md) and
-[QUICK_START_GUIDE.md](../QUICK_START_GUIDE.md) for the full local setup
+[onboarding.md](onboarding.md) for the full local setup
 (PostgreSQL, environment variables, running migrations, starting the
 service).
 

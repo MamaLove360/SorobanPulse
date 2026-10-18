@@ -15,7 +15,7 @@
 | **Welcome / Overview** | *(landing page `index.tsx`)* | Hero + feature grid |
 | **Onboarding** | `docs/onboarding.md` | Day-1 checklist, common first-build fixes |
 | **Development Environment Setup** | `docs/development-setup.md` | OS-specific, IDE, pre-commit, profiling |
-| **Quick Start Guide** | `QUICK_START_GUIDE.md` | Docker Compose fast path |
+| **Quick Start Guide** | `docs/onboarding.md` | Docker Compose fast path |
 | **FAQ** | `docs/FAQ.md` | Most-asked questions |
 | **Changelog** | `CHANGELOG.md` | Release history |
 

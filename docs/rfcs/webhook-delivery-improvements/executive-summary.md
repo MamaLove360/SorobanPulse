@@ -246,11 +246,11 @@ GET /v1/webhooks/{subscription_id}/status
 
 ## Appendix: Documents Included
 
-1. **WEBHOOK_DELIVERY_IMPROVEMENT_SPEC.md** — Complete technical specification
-2. **IMPLEMENTATION_GUIDE.md** — Step-by-step code implementation
-3. **DATABASE_MIGRATIONS.sql** — All schema changes + helper functions
-4. **TESTING_AND_VALIDATION.md** — Comprehensive testing strategy
-5. **EXECUTIVE_SUMMARY.md** — This document
+1. **[spec.md](spec.md)** — Complete technical specification
+2. **[implementation-guide.md](implementation-guide.md)** — Step-by-step code implementation
+3. **[proposed-migration.sql](proposed-migration.sql)** — All schema changes + helper functions
+4. **[testing-and-validation.md](testing-and-validation.md)** — Comprehensive testing strategy
+5. **executive-summary.md** — This document
 
 ---
 

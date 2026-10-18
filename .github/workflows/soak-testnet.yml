@@ -86,12 +86,26 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-soak-
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli
+
       # ── 2. Build ───────────────────────────────────────────────────────────
+      # The `.sqlx` offline cache does not cover every `query!` macro, so the
+      # macros are checked against the live schema (same as the CI features job).
+      - name: Install build dependencies
+        run: sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Run migrations
+        run: sqlx migrate run
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost/soroban_pulse_soak
+
       - name: Build release binary
         run: cargo build --release --locked
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost/soroban_pulse_soak
-          SQLX_OFFLINE: "true"
+          SQLX_OFFLINE: "false"
 
       # ── 3. Run the soak test ───────────────────────────────────────────────
       - name: Run soak test

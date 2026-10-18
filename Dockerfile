@@ -21,12 +21,14 @@ RUN cd web && npm run build
 # Stage 2: Build dependencies only (cached unless Cargo.lock changes)
 FROM chef AS builder
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# Extra cargo features, e.g. --build-arg CARGO_FEATURES="kafka pubsub" (see docs/features.md).
+ARG CARGO_FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} --recipe-path recipe.json
 
 # Stage 3: Build application (fast rebuild on source changes, dependencies cached)
 COPY . .
-RUN cargo build --release
+RUN cargo build --release ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Final stage: Runtime image (minimal size)
 # debian:bookworm-slim — digest pinned 2025-07-14. Update via Dependabot or manually with:

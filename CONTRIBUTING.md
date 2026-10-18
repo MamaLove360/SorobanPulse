@@ -385,6 +385,7 @@ Before requesting review, verify that the change is scoped to the issue, tests c
 - Ensure `make test` and `make lint` pass locally before opening a PR.
 - Write a clear PR description referencing the relevant issue (e.g. `Closes #75`).
 - Use Conventional Commits for all commit messages in the PR.
+- Put PR summaries and implementation reports in the PR description, not in new files at the repository root. Only `README`, `CONTRIBUTING`, `CHANGELOG`, `LICENSE`, `SECURITY`, `CODE_OF_CONDUCT` and other standard project files belong there; user guides go in `docs/guides/`, design specs in `docs/rfcs/`.
 
 ## Releases
 

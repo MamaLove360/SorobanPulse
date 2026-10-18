@@ -94,6 +94,9 @@ See [docs/schema.md](docs/schema.md) for a detailed description of the database 
 - [Web dashboard](docs/dashboard.md) — the built-in UI served at `/ui` (`SERVE_DASHBOARD=true`), its caching and Content-Security-Policy.
 - [Embeddable feed widget](packages/feed-widget/README.md) — the `<soroban-pulse-feed>` web component for showing contract activity on your own site, including CORS and API-key guidance.
 - [Design system](docs/design/design-system.md) — design tokens, component specs and usage guidelines. Brand assets are in [docs/assets/brand](docs/assets/brand/README.md).
+- [Cargo feature matrix](docs/features.md) — every cargo feature, what it enables, its dependencies, and how to build custom images.
+- [Platform integration guide](docs/guides/integration-guide.md) — GitHub, Discord, Slack and Telegram notification setup.
+- [Design specs / RFCs](docs/rfcs/README.md) and [historical implementation reports](docs/archive/README.md).
 
 ## Setup
 

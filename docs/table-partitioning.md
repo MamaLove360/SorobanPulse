@@ -286,4 +286,4 @@ partition_manager::refresh_partition_statistics(&pool).await?;
 
 - Query Plan Caching ([query-plan-tuning.md](query-plan-tuning.md))
 - Index Analysis ([index-analysis.md](index-analysis.md))
-- Database Migrations ([../DATABASE_MIGRATIONS.sql](../DATABASE_MIGRATIONS.sql))
+- Database Migrations ([../migrations/](../migrations/))

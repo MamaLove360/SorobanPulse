@@ -431,4 +431,4 @@ impl CustomQueryBuilder {
 
 - Query Plan Caching ([query-plan-tuning.md](query-plan-tuning.md))
 - API Documentation ([api-usage.md](api-usage.md))
-- Database Schema ([https://github.com/Soroban-Pulse/SorobanPulse/blob/main/DATABASE_MIGRATIONS.sql](../DATABASE_MIGRATIONS.sql))
+- Database Schema ([schema.md](schema.md))

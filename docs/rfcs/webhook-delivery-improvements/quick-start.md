@@ -458,19 +458,19 @@ tokio::spawn(run_trace_log_cleanup(pool.clone(), 90));
 ## Getting Help
 
 ### For Architecture Questions
-→ Read: `WEBHOOK_DELIVERY_IMPROVEMENT_SPEC.md`
+→ Read: [`spec.md`](spec.md)
 
 ### For Implementation Details
-→ Read: `IMPLEMENTATION_GUIDE.md`
+→ Read: [`implementation-guide.md`](implementation-guide.md)
 
 ### For Testing Strategy
-→ Read: `TESTING_AND_VALIDATION.md`
+→ Read: [`testing-and-validation.md`](testing-and-validation.md)
 
 ### For Database Schema
-→ Read: `DATABASE_MIGRATIONS.sql`
+→ Read: [`proposed-migration.sql`](proposed-migration.sql)
 
 ### For Business Context
-→ Read: `EXECUTIVE_SUMMARY.md`
+→ Read: [`executive-summary.md`](executive-summary.md)
 
 ---
 
