@@ -133,9 +133,9 @@ pub struct AppState {
     /// Issue #618: Anonymization rules configuration.
     pub anonymization_config: Option<Arc<crate::anonymization::AnonymizationConfig>>,
     /// Issue #817: Connection pool stats tracker (shared with pool monitor).
-    pub pool_stats: Arc<crate::connection_pool::PoolStats>,
+    pub pool_stats: Arc<crate::db_pool::PoolStats>,
     /// Issue #817: Adaptive pool tuner — hot-reloadable config, snapshots, counters.
-    pub adaptive_pool: Arc<crate::adaptive_pool::AdaptiveTunerState>,
+    pub adaptive_pool: Arc<crate::db_pool::AdaptiveTunerState>,
     /// Issue #817: Alias so handlers can use `state.db` (same as `state.pool`).
     pub db: sqlx::PgPool,
     /// Issue #879: Circuit breaker manager for webhook endpoints.
@@ -145,6 +145,8 @@ pub struct AppState {
     /// Deployment role for this instance — used by the readiness handler to
     /// apply role-specific readiness semantics.
     pub role: crate::config::Role,
+    /// Issue #959: Serialization cache for hot events (5-second TTL, versioned invalidation).
+    pub serialization_cache: std::sync::Arc<crate::serialization_cache::SerializedEventCache>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -189,7 +191,15 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
 - [Contract Event Schemas](https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/contract-event-schemas.md)"
     ),
     paths(
+        crate::job_scheduler::list_jobs,
+        crate::account_events::get_account_events,
+        crate::sep41::get_sep41_events,
         handlers::health,
+        crate::meta::get_meta,
+        crate::contract_resource_stats::get_contract_resource_stats,
+        crate::api_keys::create_api_key,
+        crate::api_keys::list_api_keys,
+        crate::api_keys::revoke_api_key,
         handlers::health_live,
         handlers::health_ready,
         handlers::health_postgres,
@@ -225,6 +235,8 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
         handlers::get_contract_abi,
         handlers::upsert_contract_metadata,
         handlers::get_contract_metadata,
+        crate::contract_tracker::get_contract,
+        crate::contract_specs::get_contract_spec,
         handlers::anonymize_event,
         handlers::pause_indexer,
         handlers::resume_indexer,
@@ -263,6 +275,7 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
         crate::models::SortOrder,
         crate::models::PaginationParams,
         crate::models::ContractSummary,
+        crate::contract_tracker::TrackedContract,
         crate::models::ContractDetailSummary,
         crate::models::LedgerRange,
         crate::models::EventTypeBreakdown,
@@ -286,6 +299,13 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
         crate::models::TimeseriesBucket,
         crate::models::TimeseriesResponse,
         crate::error::ValidationErrorDetail,
+        crate::meta::MetaResponse,
+        crate::contract_resource_stats::ContractResourceStats,
+        crate::contract_resource_stats::ResourceAggregate,
+        crate::api_keys::ApiKeyScope,
+        crate::api_keys::CreateApiKeyRequest,
+        crate::api_keys::CreatedApiKey,
+        crate::api_keys::ApiKeyInfo,
     )),
     tags(
         (name = "events", description = "Event indexing endpoints"),
@@ -424,6 +444,12 @@ pub fn create_router_with_tx_and_tenant_map(
         admin_api_keys: admin_api_keys.clone(),
         tenant_map: Arc::clone(&tenant_map),
         multi_tenant: config.multi_tenant,
+        // Issue #1258: scoped keys are looked up on the primary so a
+        // revocation is never hidden by replica lag.
+        pool: Some(pool.clone()),
+        require_auth: std::env::var("REQUIRE_API_KEY")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false),
     });
     let admin_auth_state = Arc::new(middleware::AdminAuthState { admin_api_keys });
     // Push-preload feature flag state — built early so it can be passed to
@@ -456,22 +482,12 @@ pub fn create_router_with_tx_and_tenant_map(
         config.query_cache_max_capacity,
     );
 
-    // Issue #817: spawn pool monitor and adaptive tuner.
-    let pool_stats = {
-        let pool_cfg = crate::connection_pool::PoolMonitorConfig {
-            max_connections: config.db_max_connections,
-            min_connections: config.db_min_connections,
-            exhaustion_threshold: 0.9,
-            sample_interval: std::time::Duration::from_secs(15),
-        };
-        crate::connection_pool::spawn_pool_monitor(pool.clone(), pool_cfg)
-    };
-    let adaptive_pool = crate::adaptive_pool::spawn_adaptive_monitor(
-        pool.clone(),
-        crate::adaptive_pool::AdaptivePoolConfig::default(),
-        config.db_max_connections,
-        config.db_min_connections,
-    );
+    // Issue #817 / #1244: monitors are started once by `db_pool::DbPool::init`;
+    // the router only shares their handles.
+    let crate::db_pool::PoolMonitors {
+        stats: pool_stats,
+        adaptive: adaptive_pool,
+    } = crate::db_pool::monitors();
 
     let circuit_breaker_manager = crate::webhook_circuit_breaker::CircuitBreakerManager::new(
         crate::webhook_circuit_breaker::CircuitBreakerConfig::default()
@@ -480,6 +496,14 @@ pub fn create_router_with_tx_and_tenant_map(
     let bulk_export_manager = crate::bulk_export::BulkExportManager::new(
         std::path::PathBuf::from("/tmp/soroban-pulse-exports"),
         24, // 24 hour retention
+    );
+
+    // Initialize serialization cache with 5-second TTL (Issue #959)
+    let serialization_cache = std::sync::Arc::new(
+        crate::serialization_cache::SerializedEventCache::new(
+            crate::serialization_cache::DEFAULT_MAX_CAPACITY,
+            5, // 5 second TTL for hot events
+        )
     );
 
     let app_state = AppState {
@@ -513,16 +537,22 @@ pub fn create_router_with_tx_and_tenant_map(
         circuit_breaker_manager,
         bulk_export_manager,
         role: config.role.clone(),
+        serialization_cache: serialization_cache.clone(),
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and
     // evict the contract_count_cache entry whenever a new event is indexed.
+    // Also invalidate serialization cache entries for the affected contract.
     {
         let mut rx = app_state.event_tx.subscribe();
-        let cache = app_state.contract_count_cache.clone();
+        let count_cache = app_state.contract_count_cache.clone();
+        let ser_cache = serialization_cache.clone();
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
-                cache.invalidate(&event.contract_id).await;
+                count_cache.invalidate(&event.contract_id).await;
+                // Invalidate serialization cache for this contract's events
+                // Using entity type version bump for all cached results of this contract
+                ser_cache.invalidate_entity_type(&format!("event:{}", event.contract_id)).await;
                 crate::metrics::record_contract_count_cache_invalidation();
             }
         });
@@ -531,7 +561,9 @@ pub fn create_router_with_tx_and_tenant_map(
     // Build governor config: burst = rate_limit_per_minute, replenish 1 token per (60/rate) seconds.
     // per_second(n) means n tokens replenished per second; we want rate_limit_per_minute / 60.
     // Use per_millisecond to avoid integer truncation: replenish 1 token every (60_000 / rate) ms.
-    let replenish_ms = 60_000u64 / u64::from(rate_limit_per_minute.max(1));
+    // Clamp to >= 1 ms: a zero period makes `GovernorConfigBuilder::finish`
+    // return `None` (limits above 60 000/min would otherwise round to 0).
+    let replenish_ms = (60_000u64 / u64::from(rate_limit_per_minute.max(1))).max(1);
     let burst = rate_limit_per_minute.max(1);
 
     // Admin routes (issue #409): gated by a dedicated admin auth layer in
@@ -543,6 +575,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
         .route("/admin/token-transfers/backfill", axum::routing::post(crate::token_events::backfill_token_transfers))
         .route("/admin/event-addresses/backfill", axum::routing::post(crate::account_events::backfill_event_addresses))
+        .route("/admin/sep41/backfill", axum::routing::post(crate::sep41::backfill_sep41))
         .route("/admin/contracts/{contract_id}/abi", axum::routing::post(handlers::register_contract_abi).get(handlers::get_contract_abi))
         .route("/admin/contracts/{contract_id}/metadata", axum::routing::post(handlers::upsert_contract_metadata).delete(handlers::delete_contract_metadata))
         .route("/admin/contracts/metadata/import", axum::routing::post(handlers::bulk_import_contract_metadata))
@@ -567,6 +600,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/statistics/jobs", axum::routing::get(handlers::get_analysis_jobs))
         // #696: SLI / SLO dashboard reporting endpoints (admin-gated)
         .route("/admin/slo/report", axum::routing::get(handlers::get_slo_report))
+        .route("/admin/jobs", axum::routing::get(crate::job_scheduler::list_jobs))
         .route("/admin/slo/sample", axum::routing::post(handlers::record_slo_sample))
         // #894: Backup verification
         .route("/admin/backup/verification/report", axum::routing::get(handlers::get_backup_verification_report))
@@ -600,6 +634,8 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/events/feed.rss", get(handlers::get_events_feed))
         .route("/events/stats", get(handlers::get_event_stats))
         .route("/contracts/{contract_id}/stats/history", get(handlers::get_contract_stats_history))
+        // Issue #1257: per-contract resource and fee statistics.
+        .route("/contracts/{contract_id}/stats", get(crate::contract_resource_stats::get_contract_resource_stats))
         .route("/events/diff", get(handlers::get_events_diff))
         .route("/events/export", get(handlers::export_events))
         .route("/events/timeseries", get(handlers::get_timeseries))
@@ -723,7 +759,12 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/compression/migrate", axum::routing::post(handlers::start_compression_migration))
         .route("/tokens/{contract_id}/transfers", axum::routing::get(crate::token_events::get_token_transfers))
         .route("/accounts/{address}/events", axum::routing::get(crate::account_events::get_account_events))
+        .route("/events/sep41", axum::routing::get(crate::sep41::get_sep41_events))
         .route("/contracts/{contract_id}/versions", axum::routing::get(crate::contract_versions::get_contract_versions))
+        // Issue #1255: deployment record (deployer, WASM hash, label)
+        .route("/contracts/{contract_id}", axum::routing::get(crate::contract_tracker::get_contract))
+        // Issue #1253: contract spec auto-fetched from on-chain WASM
+        .route("/contracts/{contract_id}/spec", axum::routing::get(crate::contract_specs::get_contract_spec))
         // Issue #607: Cached ABI endpoint
         .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached))
         // Issue #632: Feature flag client-side endpoint
@@ -776,6 +817,23 @@ pub fn create_router_with_tx_and_tenant_map(
         ));
 
 
+    // Issue #1258: scoped API key management. Always requires an admin
+    // credential, even when ADMIN_API_KEY is unset.
+    let api_key_routes = Router::new()
+        .route(
+            "/admin/api-keys",
+            post(crate::api_keys::create_api_key).get(crate::api_keys::list_api_keys),
+        )
+        .route(
+            "/admin/api-keys/{id}",
+            axum::routing::delete(crate::api_keys::revoke_api_key),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&admin_auth_state),
+            middleware::require_admin_middleware,
+        ));
+    let v1 = v1.merge(api_key_routes);
+
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)
     let deprecated = Router::new()
         .route("/events", get(handlers::get_events))
@@ -805,7 +863,9 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/healthz/rpc", get(handlers::health_rpc))
         .route("/healthz/external/{service}", get(handlers::health_external))
         .route("/unsubscribe", get(handlers::unsubscribe))
-        .route("/metrics", get(handlers::metrics));
+        .route("/metrics", get(handlers::metrics))
+        // Issue #1259: capability discovery — public and never rate-limited.
+        .route("/v1/meta", get(crate::meta::get_meta));
 
     // All other routes — subject to rate limiting.
     let rate_limited_routes = if config.multi_tenant {
@@ -814,64 +874,79 @@ pub fn create_router_with_tx_and_tenant_map(
         let effective_limit = config
             .tenant_rate_limit_per_minute
             .unwrap_or(rate_limit_per_minute);
-        let replenish_ms_t = 60_000u64 / u64::from(effective_limit.max(1));
+        let replenish_ms_t = (60_000u64 / u64::from(effective_limit.max(1))).max(1);
         let burst_t = effective_limit.max(1);
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms_t)
-                .burst_size(burst_t)
-                .key_extractor(ApiKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms_t)
+            .burst_size(burst_t)
+            .key_extractor(ApiKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     } else if behind_proxy {
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms)
-                .burst_size(burst)
-                .key_extractor(SmartIpKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms)
+            .burst_size(burst)
+            .key_extractor(SmartIpKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     } else {
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms)
-                .burst_size(burst)
-                .key_extractor(PeerIpKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms)
+            .burst_size(burst)
+            .key_extractor(PeerIpKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     };
 
     // Issue #1112: static dashboard at /ui — outside auth-gated rate limiting.
@@ -1514,12 +1589,18 @@ pub fn create_minimal_router(
 
     let sse_connections_per_ip = std::sync::Arc::new(dashmap::DashMap::new());
 
-    let pool_stats = std::sync::Arc::new(crate::connection_pool::PoolStats::new(
-        config.db_max_connections,
-    ));
-    let adaptive_pool = std::sync::Arc::new(crate::adaptive_pool::AdaptiveTunerState::new(
-        crate::adaptive_pool::AdaptivePoolConfig::default(),
-    ));
+    let crate::db_pool::PoolMonitors {
+        stats: pool_stats,
+        adaptive: adaptive_pool,
+    } = crate::db_pool::monitors();
+
+    // Initialize serialization cache with 5-second TTL (Issue #959)
+    let serialization_cache = std::sync::Arc::new(
+        crate::serialization_cache::SerializedEventCache::new(
+            crate::serialization_cache::DEFAULT_MAX_CAPACITY,
+            5, // 5 second TTL for hot events
+        )
+    );
 
     let app_state = AppState {
         pool: pool.clone(),
@@ -1552,6 +1633,7 @@ pub fn create_minimal_router(
         circuit_breaker_manager: crate::webhook_circuit_breaker::CircuitBreakerManager::new(),
         bulk_export_manager: crate::bulk_export::BulkExportManager::new(),
         role: config.role.clone(),
+        serialization_cache,
     };
 
     Router::new()

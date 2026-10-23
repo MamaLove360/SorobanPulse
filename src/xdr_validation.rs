@@ -13,11 +13,11 @@
 //! | `event_data.topic` | Every element is a valid `ScVal` JSON                   |
 
 use serde_json::Value;
-use stellar_xdr::curr::ScVal;
 use thiserror::Error;
 use tracing::warn;
 
 use crate::metrics;
+use crate::scval_format::{decode_scval, MAX_SCVAL_JSON_DEPTH};
 
 /// Structured error returned when an individual Stellar type fails validation.
 #[derive(Debug, Error, PartialEq)]
@@ -36,8 +36,10 @@ pub enum XdrValidationError {
 }
 
 /// Validate that a JSON value can be deserialized as a `ScVal`.
+///
+/// Input nested deeper than [`MAX_SCVAL_JSON_DEPTH`] is rejected (issue #1226).
 fn is_valid_sc_val(v: &Value) -> bool {
-    serde_json::from_value::<ScVal>(v.clone()).is_ok()
+    decode_scval(v).is_some()
 }
 
 /// Validate that a `contract_id` is a valid Stellar Strkey (C-type).
@@ -193,6 +195,15 @@ mod tests {
     fn valid_sc_val_bool_passes() {
         let v = json!({"bool": true});
         assert!(call(v, None));
+    }
+
+    #[test]
+    fn deeply_nested_value_fails_without_panicking() {
+        let mut v = json!({"u32": 1});
+        for _ in 0..MAX_SCVAL_JSON_DEPTH {
+            v = json!({"vec": [v]});
+        }
+        assert!(!call(v, None));
     }
 
     #[test]

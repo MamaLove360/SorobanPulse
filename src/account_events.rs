@@ -71,7 +71,26 @@ pub struct AccountEventsQuery {
     pub limit: Option<i64>,
 }
 
-/// `GET /v1/accounts/{address}/events`
+/// `GET /v1/accounts/{address}/events` — events whose topics reference
+/// `address`, across all contracts, newest first (issue #1250).
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{address}/events",
+    tag = "events",
+    params(
+        ("address" = String, Path, description = "Stellar G..., C... or M... strkey"),
+        ("role" = Option<String>, Query, description = "any (default), topic1 or topic2"),
+        ("from_ledger" = Option<i64>, Query, description = "Lowest ledger (inclusive)"),
+        ("to_ledger" = Option<i64>, Query, description = "Highest ledger (inclusive)"),
+        ("cursor" = Option<String>, Query, description = "`<ledger>:<event_id>` from a previous next_cursor"),
+        ("limit" = Option<i64>, Query, description = "Page size, 1-200 (default 50)"),
+    ),
+    responses(
+        (status = 200, description = "Events touching the address, newest first", body = serde_json::Value),
+        (status = 400, description = "Invalid address, role or cursor"),
+    ),
+    security(("api_key" = []))
+)]
 pub async fn get_account_events(
     State(state): State<AppState>,
     Path(address): Path<String>,

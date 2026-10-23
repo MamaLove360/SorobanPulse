@@ -72,7 +72,7 @@ variable "single_nat_gateway" {
 # ---------------------------------------------------------------------------
 
 variable "db_instance_class" {
-  description = "RDS instance class."
+  description = "RDS instance class. Its memory sets PostgreSQL max_connections (M); keep ceil(2 × app_container_count) × DB_MAX_CONNECTIONS ≤ 0.8 × (M − 10). See docs/capacity-planning.md#multi-replica-sizing."
   type        = string
   default     = "db.t3.medium"
 }
@@ -206,7 +206,7 @@ variable "app_port" {
 }
 
 variable "app_container_count" {
-  description = "Desired number of running application containers."
+  description = "Desired number of running application containers (N). Each opens its own DB_MAX_CONNECTIONS pool; size with C_peak = ceil(2 × N) × DB_MAX_CONNECTIONS. See docs/capacity-planning.md#multi-replica-sizing."
   type        = number
   default     = 2
 }
@@ -216,7 +216,7 @@ variable "app_container_count" {
 # ---------------------------------------------------------------------------
 
 variable "ecs_task_cpu" {
-  description = "CPU units for the Fargate task (256 = 0.25 vCPU)."
+  description = "CPU units for the Fargate task (256 = 0.25 vCPU). Every task must fit the indexer leader workload. See docs/capacity-planning.md#standby-indexer-cpu-baseline."
   type        = number
   default     = 512
 }

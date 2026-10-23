@@ -127,6 +127,20 @@ The most common XDR `ScVal` types and their JSON equivalents:
 | `ScvMap` | JSON object |
 | `ScvVec` | JSON array |
 
+### Decoding Edge Cases
+
+These cases are covered by the `fuzz_xdr_scval` target and the
+`scval_format` unit tests:
+
+- JSON that does not deserialize as an `ScVal` (plain numbers, strings,
+  unknown tags, already-anonymized data) is returned unchanged by the
+  `native` and `xdr` renderings instead of erroring.
+- `i128` / `u128` values are rebuilt from their `hi`/`lo` parts and rendered
+  as decimal strings, including the extremes (`i128::MIN`, `u128::MAX`).
+- `vec: null` and `map: null` render as `[]` and `{}` in `native` format.
+- The `divide_by_decimals` normalizer rejects `decimals` above 18 (10^19
+  overflows `i64`) with an error instead of panicking.
+
 ### Decoding Topics Manually
 
 Topics are base64-encoded XDR `ScVal` values. To decode them:

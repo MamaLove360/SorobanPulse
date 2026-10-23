@@ -22,6 +22,10 @@ pub fn start_pruning_task(
                     if let Err(e) = prune_old_events(&pool, retention_days).await {
                         error!("Pruning task failed: {}", e);
                     }
+                    // Also run partition pruning on the same schedule
+                    if let Err(e) = prune_old_partitions(&pool, retention_days).await {
+                        error!("Partition pruning task failed: {}", e);
+                    }
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
@@ -53,6 +57,35 @@ async fn prune_old_events(pool: &PgPool, retention_days: u64) -> Result<(), Box<
         sqlx::query("VACUUM ANALYZE events")
             .execute(pool)
             .await?;
+    }
+
+    Ok(())
+}
+
+/// Drop old partitions based on retention policy
+/// retention_days is converted to months (retention_days / 30)
+async fn prune_old_partitions(pool: &PgPool, retention_days: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let retention_months = std::cmp::max(1, retention_days / 30) as i32;
+    
+    // Call the drop_old_partitions function with dry_run=false
+    let rows = sqlx::query(
+        "SELECT partition_name, dropped, reason FROM drop_old_partitions($1, false)"
+    )
+    .bind(retention_months)
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let partition_name: String = row.get("partition_name");
+        let dropped: bool = row.get("dropped");
+        let reason: String = row.get("reason");
+
+        if dropped {
+            info!("Dropped partition: {} ({})", partition_name, reason);
+            crate::metrics::record_partition_dropped(&partition_name);
+        } else {
+            info!("Partition {} status: {}", partition_name, reason);
+        }
     }
 
     Ok(())

@@ -92,8 +92,11 @@ async fn archive_date(
     date: NaiveDate,
     format: &str,
 ) -> anyhow::Result<()> {
-    let day_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-    let day_end = date.and_hms_opt(23, 59, 59).unwrap().and_utc();
+    let day_start = date.and_time(chrono::NaiveTime::MIN).and_utc();
+    let day_end = date
+        .and_hms_opt(23, 59, 59)
+        .ok_or_else(|| anyhow::anyhow!("invalid archive date {date}"))?
+        .and_utc();
 
     let rows: Vec<crate::models::Event> = sqlx::query_as(
         "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, 0::bigint AS total_count \

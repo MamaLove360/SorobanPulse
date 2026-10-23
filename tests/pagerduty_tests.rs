@@ -7,7 +7,7 @@
 //! - Severity mapping
 //! - Escalation policy serialization/deserialization
 //! - Auto-resolve configuration
-//! - `deliver_pagerduty` skips filtered events
+//! - `should_trigger` skips filtered events
 //! - On-call scheduler creation (unit test — no network)
 //! - `PagerDutyConfig` default values
 
@@ -46,6 +46,7 @@ fn make_client_with(
         auto_resolve: true,
         auto_resolve_threshold_minutes: 30,
     })
+    .unwrap()
 }
 
 fn make_event(contract_id: &str, event_type: &str) -> SorobanEvent {
@@ -216,7 +217,8 @@ fn custom_severity_mapping_is_stored() {
         routing_key: "key".to_string(),
         severity_mapping: custom,
         ..PagerDutyConfig::default()
-    });
+    })
+    .unwrap();
 
     assert_eq!(
         client.config.severity_mapping.get("contract").map(String::as_str),
@@ -305,7 +307,8 @@ fn auto_resolve_can_be_disabled() {
         routing_key: "key".to_string(),
         auto_resolve: false,
         ..PagerDutyConfig::default()
-    });
+    })
+    .unwrap();
     assert!(!client.config.auto_resolve);
 }
 

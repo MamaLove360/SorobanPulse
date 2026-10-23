@@ -175,13 +175,10 @@ impl CapacityPlanner {
 
     /// Forecast resource value at days_ahead
     pub fn forecast_value(&self, metric_name: &str, days_ahead: i32) -> f64 {
-        let history = match self.metrics_history.get(metric_name) {
-            Some(h) if h.len() >= 2 => h,
+        let (previous, current) = match self.metrics_history.get(metric_name).map(|h| h.as_slice()) {
+            Some([.., previous, current]) => (previous.value, current.value),
             _ => return 0.0,
         };
-
-        let current = history.last().unwrap().value;
-        let previous = history[history.len() - 2].value;
         let daily_change = current - previous;
 
         current + (daily_change * days_ahead as f64)

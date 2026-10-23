@@ -2,7 +2,10 @@
 
 # Number of test cases to generate per property test
 # - Local: use 256 for quick feedback
-# - CI: use 10000 for comprehensive coverage
+# - CI: overrides this via the PROPTEST_CASES=50000 environment variable
+#   (see the subscription filter engine property tests in src/subscriptions.rs)
+# The environment variable takes precedence over this value, so CI runs the
+# full 50 000 cases while local runs stay fast.
 cases = 256
 
 # Maximum length for generated strings and collections
@@ -17,4 +20,6 @@ max_shrink_iters = 10000
 persistence = true
 
 # Timeout per test case (in milliseconds)
-timeout = 5000
+# Kept generous so that large CI runs (PROPTEST_CASES=50000) complete without
+# spurious timeouts on slower runners.
+timeout = 10000

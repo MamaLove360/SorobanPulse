@@ -249,6 +249,8 @@ mod tests {
             admin_api_keys: vec![],
             tenant_map: Arc::new(std::collections::HashMap::new()),
             multi_tenant: false,
+            pool: None,
+            require_auth: false,
         });
 
         let app = MiddlewareStack::new()

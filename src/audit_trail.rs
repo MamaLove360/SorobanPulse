@@ -244,7 +244,7 @@ pub async fn export_audit_logs(
     params: &AuditSearchParams,
 ) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     // Base query — date range always applied
-    let from = params.from.unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
+    let from = params.from.unwrap_or(DateTime::UNIX_EPOCH);
     let to = params.to.unwrap_or_else(Utc::now);
 
     let rows = sqlx::query_as::<_, (serde_json::Value,)>(

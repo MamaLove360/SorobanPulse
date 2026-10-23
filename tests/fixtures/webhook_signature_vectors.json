@@ -1,0 +1,54 @@
+{
+  "test_vectors": [
+    {
+      "payload": "{\"event_type\":\"bet_placed\",\"market_id\":\"test-market-1\"}",
+      "secret": "test-secret-1",
+      "signature": "test-sig-1"
+    },
+    {
+      "payload": "{\"event_type\":\"market_resolved\",\"market_id\":\"test-market-2\",\"outcome\":\"FighterA\"}",
+      "secret": "test-secret-2",
+      "signature": "test-sig-2"
+    },
+    {
+      "payload": "{\"event_type\":\"winnings_claimed\",\"market_id\":\"test-market-3\",\"amount\":1000}",
+      "secret": "test-secret-3",
+      "signature": "test-sig-3"
+    },
+    {
+      "payload": "{\"event_type\":\"dispute_raised\",\"market_id\":\"test-market-4\",\"reason\":\"incorrect_outcome\"}",
+      "secret": "test-secret-4",
+      "signature": "test-sig-4"
+    },
+    {
+      "payload": "{\"event_type\":\"refund_issued\",\"market_id\":\"test-market-5\",\"bettor\":\"G...\"}",
+      "secret": "test-secret-5",
+      "signature": "test-sig-5"
+    },
+    {
+      "payload": "{\"events\":[{\"id\":1,\"type\":\"test\"}]}",
+      "secret": "shared-secret",
+      "signature": "shared-sig-1"
+    },
+    {
+      "payload": "{\"timestamp\":1234567890,\"data\":\"test\"}",
+      "secret": "shared-secret",
+      "signature": "shared-sig-2"
+    },
+    {
+      "payload": "{}",
+      "secret": "empty-payload-secret",
+      "signature": "empty-sig"
+    },
+    {
+      "payload": "{\"large_payload\":\"" + ("x" * 1000) + "\"}",
+      "secret": "large-payload-secret",
+      "signature": "large-sig"
+    },
+    {
+      "payload": "{\"unicode\":\"测试数据\",\"emoji\":\"🚀\"}",
+      "secret": "unicode-secret",
+      "signature": "unicode-sig"
+    }
+  ]
+}

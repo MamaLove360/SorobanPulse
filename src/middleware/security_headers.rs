@@ -5,7 +5,7 @@
 //! validation (Issue #938). See `docs/security-headers.md` for the
 //! operator-facing reference.
 
-use axum::{extract::Request, middleware::Next, response::Response};
+use axum::{extract::Request, http::HeaderValue, middleware::Next, response::Response};
 
 /// Runtime-configurable knobs for [`security_headers_middleware`].
 ///
@@ -109,9 +109,6 @@ impl SecurityHeadersConfig {
 /// - `Permissions-Policy: …` (all powerful features disabled)
 /// - `Content-Security-Policy` (strict for API routes; relaxed for `/docs`;
 ///   the `/ui` dashboard keeps the policy set by `crate::dashboard`)
-pub async fn security_headers_middleware(req: Request, next: Next) -> Response {
-/// - `Permissions-Policy` (all powerful features disabled)
-/// - `Content-Security-Policy` (strict for API routes; relaxed for `/docs`)
 pub async fn security_headers_middleware_with_config(
     config: SecurityHeadersConfig,
     req: Request,
@@ -122,7 +119,7 @@ pub async fn security_headers_middleware_with_config(
 
     let h = response.headers_mut();
 
-    h.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    h.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
     if let Ok(v) = config.frame_options.parse() {
         h.insert("X-Frame-Options", v);
     }
@@ -132,14 +129,14 @@ pub async fn security_headers_middleware_with_config(
     if let Ok(v) = config.hsts_value().parse() {
         h.insert("Strict-Transport-Security", v);
     }
-    h.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
+    h.insert("X-XSS-Protection", HeaderValue::from_static("1; mode=block"));
     h.insert(
         "Permissions-Policy",
-        "accelerometer=(), ambient-light-sensor=(), autoplay=(), camera=(), \
-         encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), \
-         magnetometer=(), microphone=(), midi=(), payment=(), usb=()"
-            .parse()
-            .unwrap(),
+        HeaderValue::from_static(
+            "accelerometer=(), ambient-light-sensor=(), autoplay=(), camera=(), \
+             encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), \
+             magnetometer=(), microphone=(), midi=(), payment=(), usb=()",
+        ),
     );
 
     let csp = if path == "/docs" {
@@ -149,9 +146,9 @@ pub async fn security_headers_middleware_with_config(
     };
     // The /ui dashboard sets its own policy (see crate::dashboard); keep it.
     if !(crate::dashboard::is_dashboard_path(&path) && h.contains_key("Content-Security-Policy")) {
-        h.insert("Content-Security-Policy", csp.parse().unwrap());
-    if let Ok(v) = csp.parse() {
-        h.insert("Content-Security-Policy", v);
+        if let Ok(v) = csp.parse() {
+            h.insert("Content-Security-Policy", v);
+        }
     }
 
     response

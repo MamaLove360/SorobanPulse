@@ -467,12 +467,12 @@ impl SloTracker {
         tracker: Arc<RwLock<Self>>,
         mut shutdown_rx: watch::Receiver<bool>,
         interval_secs: u64,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if interval_secs == 0 {
             // Guard against misconfiguration that would pin the CPU.
-            return;
+            return None;
         }
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Skip the immediate fire; we just published metrics at startup.
@@ -511,7 +511,7 @@ impl SloTracker {
                     }
                 }
             }
-        });
+        }))
     }
 }
 

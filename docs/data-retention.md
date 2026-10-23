@@ -246,3 +246,122 @@ Audit logs should be immutable to normal application users. Export them to appen
 - [Audit logging](audit_logging.md)
 - [Log aggregation integration](log-aggregation.md)
 - [Backup verification CI workflow](backup-verification.md)
+
+
+## Partition Lifecycle and Pruning
+
+SorobanPulse uses monthly partitions on the `events` table for efficient data retention and purging (see [table-partitioning.md](table-partitioning.md) for details on partition setup).
+
+### Automatic partition pruning
+
+The pruning task (configured by `PURGE_INTERVAL_HOURS`) not only deletes expired rows but also **drops entire partitions** that are older than the retention window. This is more efficient than individual row deletion for large datasets because:
+
+1. **No full table scan**: PostgreSQL checks partition metadata instead of scanning every row.
+2. **Instant space reclamation**: Dropping a partition releases storage immediately; no VACUUM needed.
+3. **Lower CPU and I/O**: Batch deletes within a partition are I/O intensive; partition drops are metadata operations.
+
+### Partition retention window
+
+The partition pruning function uses this formula:
+
+```
+retention_months = max(1, RETENTION_DAYS / 30)
+cutoff_date = today - (retention_months * 30 days)
+```
+
+For example, if `RETENTION_DAYS=365`:
+- `retention_months = 365 / 30 = 12`
+- Partitions created before `today - 360 days` are dropped.
+
+### Dry-run mode
+
+Before applying partition drops to production, test the logic:
+
+```sql
+SELECT * FROM drop_old_partitions(retain_months := 12, dry_run := true);
+```
+
+Output:
+```
+partition_name       | dropped | reason
+---------------------|---------+-------
+events_2024_01       | false   | [DRY RUN] Would drop (older than 12 months)
+events_2024_02       | false   | [DRY RUN] Would drop (older than 12 months)
+events_2024_03       | false   | [DRY RUN] Would drop (older than 12 months)
+...
+events_2025_08       | false   | Retained (within 12 month retention window)
+```
+
+### Manual partition drop
+
+If you need to drop partitions outside the scheduled pruning window:
+
+```sql
+-- Check which partitions would be dropped with 6-month retention
+SELECT * FROM drop_old_partitions(retain_months := 6, dry_run := true);
+
+-- Execute the drop (careful! this is irreversible)
+SELECT * FROM drop_old_partitions(retain_months := 6, dry_run := false);
+```
+
+### Monitoring partition drops
+
+The `soroban_pulse_partitions_dropped_total` counter metric tracks the number of partitions dropped. Query it to verify pruning is running:
+
+```
+soroban_pulse_partitions_dropped_total{partition="events_2024_01"} 1
+soroban_pulse_partitions_dropped_total{partition="events_2024_02"} 1
+```
+
+### Partition metadata
+
+The `partition_drops_log` table records each partition drop for audit purposes:
+
+```sql
+SELECT partition_name, dropped_at, cutoff_date FROM partition_drops_log
+ORDER BY dropped_at DESC LIMIT 10;
+```
+
+| partition_name | dropped_at | cutoff_date |
+|---|---|---|
+| events_2024_03 | 2026-07-01 12:00:00 | 2025-07-01 |
+| events_2024_02 | 2026-07-01 12:00:00 | 2025-07-01 |
+
+## Troubleshooting
+
+### Pruning task is not running
+
+Check logs for the pruning worker:
+
+```bash
+kubectl logs -n soroban-pulse deployment/soroban-pulse --tail=100 | grep -i prun
+```
+
+### Partitions are not being dropped
+
+1. Verify the `drop_old_partitions` function exists:
+   ```sql
+   SELECT proname FROM pg_proc WHERE proname = 'drop_old_partitions';
+   ```
+
+2. Run a dry-run to see what would be dropped:
+   ```sql
+   SELECT * FROM drop_old_partitions(retain_months := 12, dry_run := true);
+   ```
+
+3. Check if events table actually has monthly partitions:
+   ```sql
+   SELECT tablename FROM pg_tables
+   WHERE tablename LIKE 'events_%' AND schemaname = 'public'
+   ORDER BY tablename;
+   ```
+
+If no partitions exist, run migration `20260727000102_partition_events_by_month.sql` first.
+
+### Storage is growing despite pruning
+
+Possible causes:
+- `EVENT_RETENTION_DAYS` is set too high or to 0 (disabled).
+- Pruning job is crashing (check logs).
+- VACUUM is not keeping up with the deletions (see [pool-optimization.md](pool-optimization.md)).
+- Non-events tables (webhooks, subscriptions, delivery_logs) are accumulating data.

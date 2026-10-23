@@ -1,5 +1,12 @@
 # Requirements Document
 
+## Implementation Notes
+
+- **Cost model:** `src/costs/calculator.rs` converts recorded metrics (RPC calls, DB queries, notification deliveries) into monetary costs using configurable per-unit rates; unset rates default to zero with a warning.
+- **Snapshot cadence:** hourly aggregation persisted to the `cost_snapshots` table; retention of at least 90 days.
+- **Reporting:** `GET /v1/admin/costs/report` returns a breakdown by component (indexer, webhook delivery, email) and by Resource_Type.
+- **Forecasting:** `src/costs/forecast.rs` applies a linear model over the most recent 14 days of snapshots; forecasts must be within 20% of actuals on a 24-hour window.
+
 ## Introduction
 
 This feature adds comprehensive operational cost tracking to the Soroban Pulse system. The goal is to measure, aggregate, and report on the costs of running infrastructure components including database operations, compute resources, RPC calls, and other services. This enables infrastructure cost optimization, budget forecasting, and per-component cost attribution.

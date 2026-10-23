@@ -196,31 +196,31 @@ impl WebhookPriorityQueue {
     }
 
     pub fn push(&self, mut task: WebhookDeliveryTask) {
-        let mut seq = self.sequence.lock().unwrap();
+        let mut seq = self.sequence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *seq += 1;
         task.sequence = *seq;
         drop(seq);
 
-        let mut metrics = self.metrics.lock().unwrap();
+        let mut metrics = self.metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         metrics.total_enqueued += 1;
         metrics.enqueued_by_priority[task.priority as usize] += 1;
         drop(metrics);
 
-        let mut heap = self.heap.lock().unwrap();
+        let mut heap = self.heap.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         heap.push(task);
-        self.metrics.lock().unwrap().current_depth = heap.len();
+        self.metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner).current_depth = heap.len();
     }
 
     /// Pop the highest priority task, recording a violation metric if it
     /// breached its max wait time (used to drive alerting).
     pub fn pop(&self) -> Option<WebhookDeliveryTask> {
-        let mut heap = self.heap.lock().unwrap();
+        let mut heap = self.heap.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = heap.pop();
         let depth = heap.len();
         drop(heap);
 
         if let Some(ref t) = task {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = self.metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             metrics.total_dequeued += 1;
             metrics.current_depth = depth;
             if t.is_violation() {
@@ -234,7 +234,7 @@ impl WebhookPriorityQueue {
     }
 
     pub fn len(&self) -> usize {
-        self.heap.lock().unwrap().len()
+        self.heap.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -242,7 +242,7 @@ impl WebhookPriorityQueue {
     }
 
     pub fn metrics(&self) -> PriorityQueueMetrics {
-        self.metrics.lock().unwrap().clone()
+        self.metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// Scan the queue for tasks currently in violation without removing them.
@@ -250,7 +250,7 @@ impl WebhookPriorityQueue {
     pub fn violating_tasks(&self) -> Vec<Uuid> {
         self.heap
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|t| t.is_violation())
             .map(|t| t.id)

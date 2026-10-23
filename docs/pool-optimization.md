@@ -23,7 +23,8 @@ scenarios that ship with the project.
 
 ### 1.1 Prometheus Metrics
 
-The following metrics are emitted by `src/connection_pool.rs`:
+The following metrics are emitted by the unified pool module `src/db_pool/`
+(monitor and adaptive tuner, both started once by `DbPool::init`):
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -35,6 +36,11 @@ The following metrics are emitted by `src/connection_pool.rs`:
 | `soroban_pulse_db_pool_wait_seconds` | Histogram | **New (Issue #995)** — time a caller queued waiting for a slot |
 | `soroban_pulse_db_pool_wait_timeout_total` | Counter | **New (Issue #995)** — waits exceeding 1 s |
 | `soroban_pulse_db_pool_queue_depth` | Gauge | **New (Issue #995)** — callers currently waiting |
+| `soroban_pulse_db_pool_size` / `_idle` / `_max` | Gauge | Open, idle and maximum connections |
+| `soroban_pulse_db_pool_adaptive_target_min` / `_max` | Gauge | Adaptive tuner recommendations (Issue #817) |
+| `soroban_pulse_db_pool_health_check_failures_total` | Counter | Failed adaptive-tuner keepalive pings |
+| `soroban_pulse_db_pool_stale_connections_total` | Counter | Idle connections flagged as potentially stale |
+| `soroban_pulse_db_pool_acquire_timeout_total` | Counter | Tracked acquisitions that timed out |
 
 ### 1.2 Grafana Quick-Start
 
@@ -91,7 +97,7 @@ cargo run 2>&1 | jq 'select(.fields.suggested_max != null)'
 
 ### 3.1 Recommendation Engine
 
-`PoolStats::suggest_pool_size` in `src/connection_pool.rs` computes
+`PoolStats::suggest_pool_size` in `src/db_pool/monitor.rs` computes
 recommendations based on observed peak utilization:
 
 | Condition | Recommendation |
@@ -276,9 +282,10 @@ env:
 
 ## 8. References
 
-- `src/connection_pool.rs` — pool monitor, wait-time tracking, sizing suggestions
-- `src/adaptive_pool.rs` — advanced adaptive tuning (Issue #817)
-- `src/pool_management.rs` — REST API for pool stats (`GET /v1/admin/pool`)
+- `src/db_pool/mod.rs` — single pool initialisation path (`connect`, `DbPool::init`)
+- `src/db_pool/monitor.rs` — pool monitor, wait-time tracking, sizing suggestions
+- `src/db_pool/adaptive.rs` — advanced adaptive tuning (Issue #817)
+- `src/db_pool/management.rs` — REST API helpers for pool stats (`GET /v1/admin/pool`)
 - `docs/runbooks/db-pool-exhaustion.md` — on-call runbook
 - `docs/alerts.yml` — Prometheus alerting rules
 - `docs/grafana-dashboard.json` — Grafana dashboard

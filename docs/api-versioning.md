@@ -104,6 +104,8 @@ Link: </v1/events>; rel="successor-version"
 
 ## Migration Guidance
 
+For a step-by-step walkthrough with a full route table, `curl` examples and a bulk-replace one-liner, see [Migration Guide: Unversioned Routes → `/v1/`](migration-unversioned-to-v1.md).
+
 ### For API Clients
 
 When you receive a `Deprecation: true` header:

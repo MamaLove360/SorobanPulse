@@ -122,9 +122,23 @@ query {
 }
 ```
 
-#### `events(filter: EventFilter, pagination: PaginationInput): [Event!]!`
+#### `events(filter: EventFilter, first: Int, after: String, last: Int, before: String): EventConnection!`
 
-Query events with optional filters and pagination.
+Query events with optional filters and Relay-style cursor pagination.
+
+The query returns a `EventConnection` (see [Relay-Style Pagination](#relay-style-pagination)) rather than a plain list.
+
+**Arguments:**
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `filter` | `EventFilter` | Optional filters (see below) |
+| `first` | `Int` | Return the first N events after `after` (forward pagination) |
+| `after` | `String` | Cursor to start after (forward pagination) |
+| `last` | `Int` | Return the last N events before `before` (backward pagination) |
+| `before` | `String` | Cursor to end before (backward pagination) |
+
+`first` and `last` are mutually exclusive; supplying both is an error. `first` defaults to 10 and is capped at 100.
 
 **Example:**
 ```graphql
@@ -136,14 +150,25 @@ query {
       ledgerMin: 1000
       ledgerMax: 2000
     }
-    pagination: { first: 50 }
+    first: 50
   ) {
-    id
-    contractId
-    eventType
-    ledger
-    ledgerCloseTime
-    value
+    edges {
+      cursor
+      node {
+        id
+        contractId
+        eventType
+        ledger
+        ledgerCloseTime
+        value
+      }
+    }
+    pageInfo {
+      hasNextPage
+      hasPreviousPage
+      startCursor
+      endCursor
+    }
   }
 }
 ```
@@ -219,17 +244,38 @@ input EventFilter {
 }
 ```
 
-#### PaginationInput
+#### EventConnection
+
+The Relay connection type returned by `events`.
 
 ```graphql
-input PaginationInput {
-  # Maximum number of results (default: 10, max: 100)
-  first: Int
-  
-  # Cursor for pagination
-  after: String
+type EventConnection {
+  edges: [EventEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type EventEdge {
+  # Opaque cursor identifying this edge; pass as `after`/`before`
+  cursor: String!
+  node: Event!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
 }
 ```
+
+#### PageInfo semantics
+
+- `hasNextPage` — `true` when more events exist after `endCursor` (i.e. the page was truncated at the end). At the last page this is `false`.
+- `hasPreviousPage` — `true` when more events exist before `startCursor`.
+- `startCursor` / `endCursor` — cursors of the first and last edge in the page, or `null` for an empty page.
+
+For forward pagination (`first`/`after`), `hasPreviousPage` is `true` whenever `after` was supplied (there is at least one preceding event). For backward pagination (`last`/`before`), `hasNextPage` is `true` whenever `before` was supplied.
 
 #### EventStats
 
@@ -270,6 +316,120 @@ subscription {
 }
 ```
 
+## Relay-Style Pagination
+
+The `events` query implements the [Relay Cursor Connections specification](https://relay.dev/graphql/connections.htm). Results are ordered by `(ledger, id)` ascending, which gives a stable total ordering.
+
+### Cursor Format
+
+Cursors are opaque strings. Internally each cursor is:
+
+```
+base64("<ledger>:<uuid>")
+```
+
+For example, the event with `ledger = 5000000` and `id = 550e8400-e29b-41d4-a716-446655440000` has the cursor:
+
+```
+NTAwMDAwMDo1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwMDA=
+```
+
+Because cursors encode the ordering key, they remain valid across requests and are not tied to an offset. Treat them as opaque: always use the `cursor` field from an edge rather than constructing cursors yourself.
+
+### Forward Pagination (`first` / `after`)
+
+Fetch the first page, then pass `pageInfo.endCursor` as `after` to fetch the next page:
+
+```graphql
+query FirstPage {
+  events(first: 10) {
+    edges {
+      cursor
+      node { id ledger }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+```
+
+```graphql
+query NextPage($after: String!) {
+  events(first: 10, after: $after) {
+    edges {
+      cursor
+      node { id ledger }
+    }
+    pageInfo {
+      hasNextPage
+      hasPreviousPage
+      endCursor
+    }
+  }
+}
+```
+
+Continue while `pageInfo.hasNextPage` is `true`. When it becomes `false` you have reached the last page.
+
+### Backward Pagination (`last` / `before`)
+
+Fetch the last page, then pass `pageInfo.startCursor` as `before` to walk backwards:
+
+```graphql
+query LastPage {
+  events(last: 10) {
+    edges {
+      cursor
+      node { id ledger }
+    }
+    pageInfo {
+      hasPreviousPage
+      startCursor
+    }
+  }
+}
+```
+
+```graphql
+query PreviousPage($before: String!) {
+  events(last: 10, before: $before) {
+    edges {
+      cursor
+      node { id ledger }
+    }
+    pageInfo {
+      hasPreviousPage
+      hasNextPage
+      startCursor
+    }
+  }
+}
+```
+
+Continue while `pageInfo.hasPreviousPage` is `true`.
+
+### Pagination with Filters
+
+Filters and cursors compose freely — the cursor is applied to the filtered result set:
+
+```graphql
+query {
+  events(
+    filter: { contractId: "CABC123" }
+    first: 25
+    after: "NTAwMDAwMDo1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwMDA="
+  ) {
+    edges {
+      cursor
+      node { id eventType ledger }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+```
+
 ## Query Examples
 
 ### Find Recent Events for a Contract
@@ -281,13 +441,22 @@ query {
       contractId: "CABC123"
       ledgerMin: 1000
     }
-    pagination: { first: 20 }
+    first: 20
   ) {
-    id
-    eventType
-    ledger
-    ledgerCloseTime
-    value
+    edges {
+      cursor
+      node {
+        id
+        eventType
+        ledger
+        ledgerCloseTime
+        value
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
   }
 }
 ```
@@ -319,11 +488,15 @@ query {
       txHash: "a1b2c3d4e5f6..."
     }
   ) {
-    id
-    contractId
-    eventType
-    topic
-    value
+    edges {
+      node {
+        id
+        contractId
+        eventType
+        topic
+        value
+      }
+    }
   }
 }
 ```
@@ -337,12 +510,20 @@ query {
       ledgerMin: 5000000
       ledgerMax: 5000100
     }
-    pagination: { first: 100 }
+    first: 100
   ) {
-    id
-    contractId
-    ledger
-    ledgerCloseTime
+    edges {
+      node {
+        id
+        contractId
+        ledger
+        ledgerCloseTime
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
   }
 }
 ```
@@ -442,17 +623,22 @@ GraphQL errors are returned in the response with details:
    }
    ```
 
-2. **Use pagination**: Always paginate large result sets
+2. **Use pagination**: Always paginate large result sets with cursors
    ```graphql
    query {
-     events(pagination: { first: 50 }) { id }
+     events(first: 50) {
+       edges { node { id } }
+       pageInfo { hasNextPage endCursor }
+     }
    }
    ```
 
 3. **Filter early**: Apply filters to reduce result set
    ```graphql
    query {
-     events(filter: { contractId: "CA..." }) { id }
+     events(filter: { contractId: "CA..." }) {
+       edges { node { id } }
+     }
    }
    ```
 
@@ -473,3 +659,4 @@ GraphQL errors are returned in the response with details:
 
 - Issue #683: Add GraphQL API layer
 - Issue #685: Handle RPC pagination cursor expiry gracefully
+- Issue #1261: Relay-style cursor pagination for the GraphQL API

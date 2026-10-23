@@ -2,7 +2,7 @@ name: Backup Verification
 
 on:
   schedule:
-    - cron: '0 2 * * 0'  # Weekly on Sunday at 02:00 UTC
+    - cron: '0 2 * * *'  # Nightly at 02:00 UTC
   workflow_dispatch:
 
 # Minimal default permissions.
@@ -14,56 +14,57 @@ jobs:
     name: Verify backup and restore integrity
     runs-on: ubuntu-latest
 
-    services:
-      source_db:
-        image: postgres:14
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: soroban_pulse_source
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      restore_db:
-        image: postgres:14
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: soroban_pulse_restore
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     env:
-      SOURCE_URL: postgres://postgres:postgres@localhost:5432/soroban_pulse_source
-      RESTORE_URL: postgres://postgres:postgres@localhost:5433/soroban_pulse_restore
+      # Connection details for the `db` service defined in docker-compose.yml
+      # (postgres:16-alpine). The source database is the compose DB; the
+      # restore target is a separate database on the same server.
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      SOURCE_DB: soroban_pulse
+      RESTORE_DB: soroban_pulse_restore
+      SOURCE_URL: postgres://postgres:postgres@localhost:5432/soroban_pulse
+      RESTORE_URL: postgres://postgres:postgres@localhost:5432/soroban_pulse_restore
       BACKUP_DEST: /tmp/backups
       BACKUP_ENCRYPTION_KEY: test-encryption-key-12345
+      RESTORE_TIME_LIMIT_SECONDS: 60
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install GPG
-        run: sudo apt-get update && sudo apt-get install -y gnupg
+      - name: Install GPG and PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnupg postgresql-client
+
+      - name: Start database from docker-compose.yml
+        run: docker compose up -d db
+
+      - name: Wait for database to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            if docker compose exec -T db pg_isready -U "$PGUSER" -d "$SOURCE_DB" >/dev/null 2>&1; then
+              echo "✓ Database is ready"
+              exit 0
+            fi
+            echo "Waiting for database... ($i/60)"
+            sleep 2
+          done
+          echo "ERROR: Database did not become healthy in time"
+          docker compose logs db
+          exit 1
 
       - name: Apply migrations to source DB
         run: |
           for f in migrations/*.sql; do
-            psql "$SOURCE_URL" -f "$f" || true
+            echo "Applying $f"
+            psql "$SOURCE_URL" -v ON_ERROR_STOP=1 -f "$f"
           done
 
-      - name: Seed source DB with test data
+      - name: Seed source DB with 10 000 rows
         run: |
-          psql "$SOURCE_URL" <<'SQL'
+          psql "$SOURCE_URL" -v ON_ERROR_STOP=1 <<'SQL'
             INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
             SELECT
               'C' || lpad(i::text, 55, '0'),
@@ -72,11 +73,18 @@ jobs:
               i,
               now(),
               '{}'::jsonb
-            FROM generate_series(1, 50) AS i;
+            FROM generate_series(1, 10000) AS i;
           SQL
+          SEEDED=$(psql "$SOURCE_URL" -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+          echo "Seeded rows: $SEEDED"
+          if [ "$SEEDED" != "10000" ]; then
+            echo "ERROR: Expected 10000 seeded rows, got $SEEDED"
+            exit 1
+          fi
 
       - name: Run encrypted backup
         run: |
+          mkdir -p "$BACKUP_DEST"
           DATABASE_URL="$SOURCE_URL" \
           BACKUP_ENCRYPTION_KEY="$BACKUP_ENCRYPTION_KEY" \
           BACKUP_DEST="$BACKUP_DEST" \
@@ -90,20 +98,34 @@ jobs:
             exit 1
           fi
           echo "Encrypted backup created: $BACKUP_FILE"
-          file "$BACKUP_FILE" | grep -q "GPG" && echo "✓ File is GPG encrypted"
+          if ! file "$BACKUP_FILE" | grep -q "GPG"; then
+            echo "ERROR: Backup file is not GPG encrypted"
+            exit 1
+          fi
+          echo "✓ File is GPG encrypted"
 
-      - name: Apply migrations to restore DB
+      - name: Drop and recreate restore database
         run: |
-          for f in migrations/*.sql; do
-            psql "$RESTORE_URL" -f "$f" || true
-          done
+          psql "postgres://postgres:postgres@localhost:5432/postgres" -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS $RESTORE_DB;"
+          psql "postgres://postgres:postgres@localhost:5432/postgres" -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE $RESTORE_DB;"
 
-      - name: Restore encrypted backup to target DB
+      - name: Restore encrypted backup and assert under 60 seconds
         run: |
           BACKUP_FILE=$(ls "$BACKUP_DEST"/*.dump.gpg | head -1)
+          START=$(date +%s)
           DATABASE_URL="$RESTORE_URL" \
           BACKUP_ENCRYPTION_KEY="$BACKUP_ENCRYPTION_KEY" \
           bash scripts/restore.sh "$BACKUP_FILE" <<< "yes"
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "Restore completed in ${ELAPSED}s (limit: ${RESTORE_TIME_LIMIT_SECONDS}s)"
+          if [ "$ELAPSED" -ge "$RESTORE_TIME_LIMIT_SECONDS" ]; then
+            echo "ERROR: Restore took ${ELAPSED}s, exceeding the ${RESTORE_TIME_LIMIT_SECONDS}s limit for a 10 000-row dataset"
+            exit 1
+          fi
+          echo "✓ Restore completed within the time limit"
 
       - name: Verify row counts match
         run: |
@@ -115,4 +137,12 @@ jobs:
             echo "ERROR: Row count mismatch — backup verification failed"
             exit 1
           fi
+          if [ "$SOURCE_COUNT" != "10000" ]; then
+            echo "ERROR: Expected 10000 rows, got $SOURCE_COUNT"
+            exit 1
+          fi
           echo "✓ Backup verification passed: $SOURCE_COUNT rows match"
+
+      - name: Tear down docker-compose services
+        if: always()
+        run: docker compose down -v

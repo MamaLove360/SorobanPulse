@@ -31,7 +31,7 @@ variable "task_memory" {
 }
 
 variable "desired_count" {
-  description = "Desired number of running task instances."
+  description = "Desired number of running task instances. DB connections scale as desired_count × DB_MAX_CONNECTIONS (×2 during deploys). See docs/capacity-planning.md#multi-replica-sizing."
   type        = number
   default     = 2
 }

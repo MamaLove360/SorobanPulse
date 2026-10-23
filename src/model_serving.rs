@@ -228,15 +228,15 @@ impl ModelRegistry {
         backend: Arc<dyn ServableModel>,
     ) {
         let key = Self::version_key(&version.model_name, &version.version);
-        self.backends.write().unwrap().insert(key.clone(), backend);
+        self.backends.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone(), backend);
         self.stats
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(key)
             .or_insert_with(ModelPerformanceStats::default);
         self.versions
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(version.model_name.clone())
             .or_default()
             .push(version);
@@ -246,7 +246,7 @@ impl ModelRegistry {
     /// same model. This is the model version management surface used for
     /// rollouts and rollbacks.
     pub fn activate_version(&self, model_name: &str, version: &str) -> Result<(), ModelServingError> {
-        let mut versions = self.versions.write().unwrap();
+        let mut versions = self.versions.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entries = versions
             .get_mut(model_name)
             .ok_or_else(|| ModelServingError::ModelNotFound(model_name.to_string()))?;
@@ -264,7 +264,7 @@ impl ModelRegistry {
     }
 
     fn active_version(&self, model_name: &str) -> Result<String, ModelServingError> {
-        let versions = self.versions.read().unwrap();
+        let versions = self.versions.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entries = versions
             .get(model_name)
             .ok_or_else(|| ModelServingError::ModelNotFound(model_name.to_string()))?;
@@ -287,7 +287,7 @@ impl ModelRegistry {
         let backend = self
             .backends
             .read()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .cloned()
             .ok_or_else(|| ModelServingError::ModelNotFound(key.clone()))?;
@@ -297,7 +297,7 @@ impl ModelRegistry {
         let result = backend.predict(&features);
         let latency_ms = start.elapsed().unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0;
 
-        let mut stats = self.stats.write().unwrap();
+        let mut stats = self.stats.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = stats.entry(key).or_default();
         match result {
             Ok((label, score)) => {
@@ -321,13 +321,13 @@ impl ModelRegistry {
     /// monitoring/tracking surface below.
     pub fn performance(&self, model_name: &str, version: &str) -> Option<ModelPerformanceStats> {
         let key = Self::version_key(model_name, version);
-        self.stats.read().unwrap().get(&key).cloned()
+        self.stats.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned()
     }
 
     pub fn list_versions(&self, model_name: &str) -> Vec<ModelVersion> {
         self.versions
             .read()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(model_name)
             .cloned()
             .unwrap_or_default()

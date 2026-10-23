@@ -44,8 +44,9 @@ For programmatic use (e.g. tests, alternate entry points), construct a
 
 Allowed origins are configured via `ALLOWED_ORIGINS` (comma-separated) and
 consumed by `build_cors` in `src/routes.rs`. At config-load time,
-`Config::from_env` (in `src/config.rs`) now runs every configured origin
-through `validate_cors_origins`, which rejects:
+`ConfigBuilder::build` (in `src/config/builder.rs`, via
+`config_validation::check_cors`) runs every configured origin through
+`validate_cors_origins`, which rejects:
 
 - any value without an `http://` or `https://` scheme,
 - any value containing a path, query string, or fragment,

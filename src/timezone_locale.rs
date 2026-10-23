@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{
-    DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, TimeZone, Timelike, Utc,
+    DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, Offset, TimeZone, Timelike, Utc,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -124,7 +124,7 @@ impl TimezoneConfig {
     pub fn convert_from_utc(&self, utc: &DateTime<Utc>) -> DateTime<FixedOffset> {
         let offset_secs = self.effective_offset(utc.month());
         let fixed = FixedOffset::east_opt(offset_secs)
-            .unwrap_or(FixedOffset::east_opt(0).unwrap());
+            .unwrap_or_else(|| Utc.fix());
         utc.with_timezone(&fixed)
     }
 
@@ -141,7 +141,7 @@ impl TimezoneConfig {
         if let Ok(naive) = s.parse::<NaiveDateTime>() {
             let offset_secs = self.effective_offset(naive.month());
             let fixed = FixedOffset::east_opt(offset_secs)
-                .unwrap_or(FixedOffset::east_opt(0).unwrap());
+                .unwrap_or_else(|| Utc.fix());
             let local = fixed
                 .from_local_datetime(&naive)
                 .single()

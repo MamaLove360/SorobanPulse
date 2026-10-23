@@ -140,13 +140,13 @@ pub struct PagerDutyClient {
 
 impl PagerDutyClient {
     /// Construct a client from an explicit config.
-    pub fn new(config: PagerDutyConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build PagerDuty HTTP client");
+    pub fn new(config: PagerDutyConfig) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            Client::builder().timeout(Duration::from_secs(10)),
+            "pagerduty",
+        )?;
 
-        Self { client, config }
+        Ok(Self { client, config }
     }
 
     /// Build a client from the global application config when a routing key is
@@ -164,7 +164,13 @@ impl PagerDutyClient {
             auto_resolve: config.pagerduty_auto_resolve,
             auto_resolve_threshold_minutes: config.pagerduty_auto_resolve_threshold_minutes,
         };
-        Some(Arc::new(Self::new(pd_config)))
+        match Self::new(pd_config) {
+            Ok(client) => Some(Arc::new(client)),
+            Err(e) => {
+                error!(error = %e, "PagerDuty notifications disabled");
+                None
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -615,7 +621,7 @@ impl PagerDutyClient {
         .await
         {
             error!(error = %e, dedup_key = %dedup_key, "Failed to upsert PagerDuty incident");
-        }
+        })
     }
 }
 
@@ -623,28 +629,6 @@ impl PagerDutyClient {
 // Convenience top-level function
 // ---------------------------------------------------------------------------
 
-/// Trigger a PagerDuty incident for `event` when it passes the client's
-/// configured filters.  Errors are logged and swallowed so callers don't need
-/// to handle them.
-pub async fn deliver_pagerduty(
-    client: &PagerDutyClient,
-    event: SorobanEvent,
-    integration_id: Option<Uuid>,
-    pool: Option<&sqlx::PgPool>,
-) {
-    if !client.should_trigger(&event) {
-        return;
-    }
-
-    if let Err(e) = client.trigger_incident(&event, integration_id, pool).await {
-        error!(
-            error        = %e,
-            contract_id  = %event.contract_id,
-            event_type   = %event.event_type,
-            "Failed to deliver PagerDuty notification"
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -672,6 +656,7 @@ mod tests {
             auto_resolve: true,
             auto_resolve_threshold_minutes: 30,
         })
+        .unwrap()
     }
 
     fn make_event(contract_id: &str, event_type: &str) -> SorobanEvent {
@@ -713,7 +698,7 @@ mod tests {
         let mut config = PagerDutyConfig::default();
         config.routing_key = "key".to_string();
         config.contract_filter = vec!["CABC".to_string()];
-        let client = PagerDutyClient::new(config);
+        let client = PagerDutyClient::new(config).unwrap();
         let event = make_event("CABC", "contract");
         assert!(client.should_trigger(&event));
     }
@@ -723,7 +708,7 @@ mod tests {
         let mut config = PagerDutyConfig::default();
         config.routing_key = "key".to_string();
         config.contract_filter = vec!["COTHER".to_string()];
-        let client = PagerDutyClient::new(config);
+        let client = PagerDutyClient::new(config).unwrap();
         let event = make_event("CABC", "contract");
         assert!(!client.should_trigger(&event));
     }
@@ -733,7 +718,7 @@ mod tests {
         let mut config = PagerDutyConfig::default();
         config.routing_key = "key".to_string();
         config.event_type_filter = vec!["system".to_string()];
-        let client = PagerDutyClient::new(config);
+        let client = PagerDutyClient::new(config).unwrap();
 
         let event_match = make_event("CABC", "system");
         let event_miss = make_event("CABC", "contract");

@@ -97,6 +97,11 @@
       {
         "command": "sorobanpulse.stopTailEvents",
         "title": "Soroban Pulse: Stop Tailing Events"
+      },
+      {
+        "command": "sorobanpulse.openLivePanel",
+        "title": "Soroban Pulse: Open Live Events Panel",
+        "icon": "$(pulse)"
       }
     ],
     "menus": {
@@ -110,6 +115,12 @@
           "command": "sorobanpulse.testWebhook",
           "when": "view == sorobanpulse.apiExplorer",
           "group": "navigation"
+        },
+        {
+          "command": "sorobanpulse.openLivePanel",
+          "when": "view == sorobanpulse.apiExplorer",
+          "group": "navigation",
+          "icon": "$(pulse)"
         }
       ],
       "view/item/context": [
@@ -146,6 +157,11 @@
           "type": "number",
           "default": 10000,
           "description": "Request timeout in milliseconds."
+        },
+        "sorobanpulse.hoverEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable hover provider for contract IDs in source files."
         }
       }
     }
@@ -157,7 +173,9 @@
     "lint": "eslint src --ext ts",
     "test": "npm run compile && node --test \"out/test/*.test.js\"",
     "package": "vsce package",
-    "publish": "vsce publish"
+    "publish": "vsce publish",
+    "publish:ovsx": "ovsx publish",
+    "publish:all": "npm run publish && npm run publish:ovsx"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
@@ -166,6 +184,7 @@
     "@typescript-eslint/parser": "^6.0.0",
     "@vscode/vsce": "^2.22.0",
     "eslint": "^8.0.0",
+    "ovsx": "^0.8.0",
     "typescript": "^5.3.0"
   }
 }

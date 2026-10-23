@@ -26,6 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Generate OpenAPI spec
+        run: cargo run --bin gen_openapi > openapi.json
+        working-directory: .
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -34,6 +41,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Generate API client
+        run: npm run gen-api
 
       - name: ESLint
         run: npm run lint
@@ -50,6 +60,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Generate OpenAPI spec
+        run: cargo run --bin gen_openapi > openapi.json
+        working-directory: .
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -58,6 +75,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Generate API client
+        run: npm run gen-api
 
       - name: Run tests
         run: npm run test
@@ -69,6 +89,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Generate OpenAPI spec
+        run: cargo run --bin gen_openapi > openapi.json
+        working-directory: .
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -77,6 +104,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Generate API client
+        run: npm run gen-api
 
       - name: Build
         run: npm run build

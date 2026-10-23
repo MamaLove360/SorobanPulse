@@ -98,3 +98,28 @@ async def test_request_outside_context_manager_is_rejected():
     client = AsyncSorobanPulseClient(api_key="sp_test_123")
     with pytest.raises(RuntimeError):
         await client.list_events()
+
+
+@pytest.mark.asyncio
+async def test_get_meta_returns_typed_response():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={
+            "features": ["classical-crypto", "dashboard", "default"],
+            "version": "1.0.0",
+            "build_sha": "076772f1a2b3",
+            "api_version": "v1",
+        })
+
+    async with client_with(handler) as client:
+        meta = await client.get_meta()
+
+    assert seen["url"] == f"{BASE}/meta"
+    assert meta.features == ["classical-crypto", "dashboard", "default"]
+    assert meta.version == "1.0.0"
+    assert meta.build_sha == "076772f1a2b3"
+    assert meta.api_version == "v1"
+    assert meta.has_feature("dashboard")
+    assert not meta.has_feature("kafka")

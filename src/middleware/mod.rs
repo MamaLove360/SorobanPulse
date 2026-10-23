@@ -6,7 +6,7 @@
 //! |---------------------|------------------------------------------------|
 //! | `request_id`        | `request_id_middleware`                        |
 //! | `tracing`           | `tracing_middleware`, `request_tracking_middleware` |
-//! | `auth`              | `auth_middleware`, `admin_auth_middleware`, `AuthState`, `AdminAuthState`, `TenantId`, `hash_api_key` |
+//! | `auth`              | `auth_middleware`, `admin_auth_middleware`, `require_admin_middleware`, `AuthState`, `AdminAuthState`, `TenantId`, `hash_api_key` |
 //! | `security_headers`  | `security_headers_middleware`                  |
 //! | `http_utils`        | `head_middleware`, `cache_middleware`           |
 //! | `builder`           | [`MiddlewareStack`] fluent builder             |
@@ -45,6 +45,7 @@ pub mod tracing;
 
 pub use auth::{
     AdminAuthState, AuthState, TenantId, admin_auth_middleware, auth_middleware, hash_api_key,
+    require_admin_middleware,
 };
 pub use builder::MiddlewareStack;
 pub use http_utils::{cache_middleware, head_middleware};

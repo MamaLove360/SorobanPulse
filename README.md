@@ -78,6 +78,8 @@ See [docs/schema.md](docs/schema.md) for a detailed description of the database 
 
 ## Documentation
 
+- [Tutorial: token transfer alert bot](docs/tutorials/token-alert-bot.md) — index a testnet token and post large transfers to Discord.
+- [Configuration reference](docs/configuration.md) — every environment variable with its type, default and feature flag.
 - [Developer onboarding guide](docs/onboarding.md) — start here if you're new: a day-1 checklist and fixes for the most common first-build issues.
 - [Stellar & Soroban glossary](docs/glossary.md) — plain-language definitions of ledger, TOID, ScVal, XDR, Strkey, SAC, SEP-41, TTL/archival, RPC retention, and Soroban events 101.
 - [Module map](docs/module-map.md) — every `src/` module grouped by domain with one-line descriptions and "where do I start?" guidance.
@@ -116,26 +118,29 @@ cp .env.example .env
 
 Open the newly created `.env` file in your editor and fill in your own real values. Be sure to replace the placeholder credentials (e.g., `<USER>`, `<PASSWORD>`) with your actual database and network details.
 
-| Variable          | Description                          | Default                                  |
-|-------------------|--------------------------------------|------------------------------------------|
-| `DATABASE_URL`    | PostgreSQL connection string         | required                                 |
-| `STELLAR_RPC_URL` | Soroban RPC endpoint                 | `https://soroban-testnet.stellar.org`    |
-| `DB_MAX_CONNECTIONS` | Max number of connections in the Postgres pool | `10` |
-| `DB_MIN_CONNECTIONS` | Min number of connections in the Postgres pool | `1` |
-| `START_LEDGER`    | Ledger to start indexing from (0 = latest) | `0`                               |
-| `PORT`            | HTTP server port                     | `3000`                                   |
-| `RUST_LOG`        | Log verbosity level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
-| `API_KEY`         | Optional key for API authentication  | (disabled)                               |
-| `ADMIN_API_KEY`   | Key required for `/v1/admin/*` endpoints (independent of `API_KEY`) | (disabled) |
-| `RUST_LOG_FORMAT` | Log output format (`text` or `json`) | `text`                                   |
-| `INDEXER_LAG_WARN_THRESHOLD` | Indexer lag warning threshold (ledgers) | `100`                                   |
-| `HEALTH_CHECK_TIMEOUT_MS`   | Timeout for the health check DB ping     | `2000`                                  |
-| `INDEX_CHECK_INTERVAL_HOURS` | How often the index usage monitor runs (hours) | `24`                             |
-| `RATE_LIMIT_PER_MINUTE` | Maximum requests per IP per minute (0 = unlimited) | `60`                         |
-| `SSE_KEEPALIVE_SECS` | SSE keep-alive ping interval in seconds (1–60) | `15`                              |
-| `INDEXER_LOCK_RETRY_SECS` | How often standby replicas retry the advisory lock | `30`                    |
-| `SLOW_QUERY_THRESHOLD_MS` | Queries exceeding this duration are logged at WARN and counted in metrics | `1000` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry OTLP collector endpoint (when built with `otel` feature) | `http://localhost:4317` |
+For the full list of all environment variables with defaults and descriptions, see **[docs/configuration.md](docs/configuration.md)**.
+
+The table is auto-generated from `src/config.rs` — run `make gen-env-docs` to refresh it.
+
+The most common variables to set are:
+
+| Variable | Description | Default |
+|---|---|---|
+| `DATABASE_URL` | PostgreSQL connection string | required |
+| `STELLAR_RPC_URL` | Soroban RPC endpoint | `https://soroban-testnet.stellar.org` |
+| `PORT` | HTTP server port | `3000` |
+| `API_KEY` | Optional key for API authentication | (disabled) |
+| `RUST_LOG` | Log verbosity level | `info` |
+The essentials:
+
+- `DATABASE_URL` — PostgreSQL connection string (required)
+- `STELLAR_RPC_URL` — Soroban RPC endpoint (default `https://soroban-testnet.stellar.org`)
+- `START_LEDGER` — ledger to start indexing from (default `0` = latest)
+- `PORT` — HTTP server port (default `3000`)
+- `API_KEY` / `ADMIN_API_KEY` — API and admin authentication (disabled when unset)
+- `RUST_LOG` — log verbosity (default `info`)
+
+Every other setting is listed in the [configuration reference](docs/configuration.md), which is generated from `src/config/reference.rs` (`make gen-config-docs`) and checked in CI.
 
 > **Note on Authentication:** You can enable optional API key authentication by setting the `API_KEY` environment variable. When set, all requests (except `/health` and `/healthz/*` endpoints) will require either an `Authorization: Bearer <API_KEY>` or an `X-Api-Key: <API_KEY>` header. If `API_KEY` is unset or omitted from your configuration, authentication is bypassed and all requests pass through.
 
@@ -179,7 +184,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full developer workflow.
 The project employs a comprehensive testing strategy across multiple dimensions:
 
 - **Unit & Integration Tests**: Standard test suite (`make test`)
-- **Property-Based Tests**: Discover edge cases with `proptest` — see [docs/property-testing.md](docs/property-testing.md)
+- **Property-Based Tests**: Discover edge cases with `proptest` — see [docs/property-based-testing.md](docs/property-based-testing.md)
 - **Mutation Testing**: Evaluate test coverage quality with `cargo-mutants` — see [docs/mutation-testing.md](docs/mutation-testing.md)
 - **API Contract Tests**: Verify client-server API compatibility — see [docs/contract-testing.md](docs/contract-testing.md)
 - **Security Tests**: OWASP Top 10, auth bypass, crypto verification, regression tests — see [docs/security-testing.md](docs/security-testing.md)

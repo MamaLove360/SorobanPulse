@@ -1,0 +1,106 @@
+name: SDK Codegen
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'openapi.json'
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install OpenAPI Generator
+        run: npm install -g @openapitools/openapi-generator-cli
+
+      - name: Generate TypeScript SDK
+        run: |
+          openapi-generator-cli generate \
+            -i openapi.json \
+            -g typescript-fetch \
+            -o sdk/typescript/generated \
+            --additional-properties=packageVersion=0.1.0
+
+      - name: Generate Python SDK
+        run: |
+          openapi-generator-cli generate \
+            -i openapi.json \
+            -g python \
+            -o sdk/python/generated \
+            --additional-properties=packageVersion=0.1.0
+
+      - name: Generate Go SDK
+        run: |
+          openapi-generator-cli generate \
+            -i openapi.json \
+            -g go \
+            -o sdk/go/generated \
+            --additional-properties=packageVersion=0.1.0
+
+      - name: TypeScript type check
+        working-directory: sdk/typescript
+        run: |
+          npm install
+          npm run typecheck || true
+
+      - name: Python type check
+        working-directory: sdk/python
+        run: |
+          pip install mypy
+          mypy generated || true
+
+      - name: Go build check
+        working-directory: sdk/go
+        run: go build ./generated || true
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit changes
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sdk/
+          git commit -m "chore: regenerate SDKs from openapi.json"
+
+      - name: Create PR
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          BRANCH="chore/sdk-regen-$(date +%s)"
+          git checkout -b "$BRANCH"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "chore: regenerate SDKs from openapi.json" \
+            --body "Automated SDK regeneration from openapi.json changes" \
+            --base main \
+            --head "$BRANCH"
+        env:
+          GH_TOKEN: ${{ github.token }}

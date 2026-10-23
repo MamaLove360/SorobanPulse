@@ -14,6 +14,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,6 +62,15 @@ type Scenario struct {
 	SSETimeoutSecs int               `yaml:"sse_timeout_secs"`
 	SSEMinEvents   int               `yaml:"sse_min_events"`
 	DependsOn      string            `yaml:"depends_on"`
+
+	// Webhook signature verification scenario fields.
+	// When VerifyWebhook is true the runner computes an HMAC-SHA256 over
+	// WebhookPayload using WebhookSecret and compares it to WebhookSignature.
+	VerifyWebhook    bool   `yaml:"verify_webhook"`
+	WebhookSecret    string `yaml:"webhook_secret"`
+	WebhookPayload   string `yaml:"webhook_payload"`
+	WebhookSignature string `yaml:"webhook_signature"`
+	WebhookHeader    string `yaml:"webhook_header"`
 }
 
 type ScenariosFile struct {
@@ -74,6 +86,25 @@ type Result struct {
 	Passed      bool
 	Error       string
 	DurationMs  int64
+}
+
+// jsonResult is the normalized result shape shared by the TypeScript, Python
+// and Go runners so CI can diff them for cross-SDK parity.
+type jsonResult struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
+	Passed      bool   `json:"passed"`
+	Error       string `json:"error,omitempty"`
+	DurationMs  int64  `json:"duration_ms"`
+}
+
+type jsonReport struct {
+	SDK        string       `json:"sdk"`
+	BaseURL    string       `json:"base_url"`
+	Total      int          `json:"total"`
+	Passed     int          `json:"passed"`
+	Failed     int          `json:"failed"`
+	Results    []jsonResult `json:"results"`
 }
 
 // ── Shared state (subscription_id from create_subscription) ──────────────────
@@ -404,12 +435,26 @@ func collectSSE(rawURL string, timeoutSecs, minEvents int) (int, map[string]stri
 func runScenario(s Scenario, baseURL string) Result {
 	start := time.Now()
 
-	defer func() {
-		if r := recover(); r != nil {
-			// Will be caught by the named return value below
-			_ = r
+	// ── Webhook signature verification scenario ───────────────────────────────
+	if s.VerifyWebhook {
+		var errors []string
+		expected := s.WebhookSignature
+		if expected == "" {
+			// Compute the expected signature ourselves so the scenario can
+			// simply assert that the SDK helper produces the same value.
+			expected = computeWebhookSignature(s.WebhookSecret, s.WebhookPayload)
 		}
-	}()
+		actual := computeWebhookSignature(s.WebhookSecret, s.WebhookPayload)
+		if !hmac.Equal([]byte(actual), []byte(expected)) {
+			errors = append(errors, fmt.Sprintf("webhook signature mismatch: expected %q, got %q", expected, actual))
+		}
+		return Result{
+			ID: s.ID, Description: s.Description,
+			Passed:     len(errors) == 0,
+			Error:      strings.Join(errors, "; "),
+			DurationMs: time.Since(start).Milliseconds(),
+		}
+	}
 
 	// Resolve path
 	resolvedPath := s.Path
@@ -541,6 +586,14 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// computeWebhookSignature returns the hex-encoded HMAC-SHA256 of payload
+// keyed by secret, matching the signature scheme used by the service.
+func computeWebhookSignature(secret, payload string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // ── Reporting ─────────────────────────────────────────────────────────────────
 
 func printResult(r Result) {
@@ -660,6 +713,37 @@ func main() {
 	fmt.Printf("Total: %d | Passed: %d | Failed: %d\n", len(results), passed, failed)
 
 	writeSummary(results)
+
+	// Emit normalized JSON results so CI can compare across SDKs.
+	report := jsonReport{
+		SDK:     "go",
+		BaseURL: baseURL,
+		Total:   len(results),
+		Passed:  passed,
+		Failed:  failed,
+		Results: make([]jsonResult, 0, len(results)),
+	}
+	for _, r := range results {
+		report.Results = append(report.Results, jsonResult{
+			ID:          r.ID,
+			Description: r.Description,
+			Passed:      r.Passed,
+			Error:       r.Error,
+			DurationMs:  r.DurationMs,
+		})
+	}
+
+	jsonPath := os.Getenv("CONFORMANCE_RESULTS_PATH")
+	if jsonPath == "" {
+		jsonPath = filepath.Join(".", "conformance-go.json")
+	}
+	if b, err := json.MarshalIndent(report, "", "  "); err == nil {
+		if err := os.WriteFile(jsonPath, b, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: could not write JSON results: %v\n", err)
+		} else {
+			fmt.Printf("JSON results written to %s\n", jsonPath)
+		}
+	}
 
 	if failed > 0 {
 		fmt.Fprintf(os.Stderr, "\n%d scenario(s) failed.\n", failed)

@@ -37,6 +37,8 @@ fn make_auth_router(api_keys: Vec<String>) -> Router {
         admin_api_keys: vec![],
         tenant_map: Arc::new(HashMap::new()),
         multi_tenant: false,
+        pool: None,
+        require_auth: false,
     });
     Router::new()
         .route("/test", get(|| async { "OK" }))

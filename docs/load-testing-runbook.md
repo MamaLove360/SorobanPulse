@@ -19,6 +19,10 @@ Operational guide for running, interpreting, and maintaining the Soroban Pulse l
   - [Soak Test](#soak-test)
   - [Multi-Contract Queries](#multi-contract-queries)
   - [Webhook Delivery](#webhook-delivery)
+    - [Retry Storm](#retry-storm)
+    - [Sustained Load (10 min)](#sustained-load-10-min)
+    - [DLQ Replay Under Concurrent Load](#dlq-replay-under-concurrent-load)
+    - [Webhook SLO Thresholds](#webhook-slo-thresholds)
 - [Performance Budgets](#performance-budgets)
 - [Updating Baselines](#updating-baselines)
 - [Webhook Delivery Setup](#webhook-delivery-setup)
@@ -127,6 +131,10 @@ k6 run --out json=tests/load/results/stress_raw.json tests/load/stress.js
 | `CONTRACT_IDS` | built-in stubs | Comma-separated real contract IDs (`multi_contract.js`) |
 | `ADMIN_API_KEY` | — | Admin key for replay endpoint (`webhook_delivery.js`) |
 | `WEBHOOK_RECEIVER` | — | Stub receiver URL to poll (`webhook_delivery.js`) |
+| `SCENARIO` | `sustained` | Webhook scenario to run: `sustained`, `retry_storm`, or `dlq_replay` (`webhook_delivery.js`) |
+| `FAILURE_RATE` | `0.8` | Fraction of webhook endpoints forced to return 500 (`webhook_delivery.js`) |
+| `DLQ_REPLAY_RATE` | `5` | DLQ replay requests per second issued during the replay scenario (`webhook_delivery.js`) |
+| `WEBHOOK_DURATION` | `10m` | Sustained-load duration for the webhook scenarios (`webhook_delivery.js`) |
 
 ---
 
@@ -407,6 +415,78 @@ A rising failure counter during the test indicates:
 
 Check `soroban_pulse_webhook_failures_total` in the Grafana dashboard.
 
+`webhook_delivery.js` exposes three scenarios, selected with the `SCENARIO` env var:
+
+| `SCENARIO` | Purpose | Default duration |
+|---|---|---|
+| `sustained` | Delivery throughput with 80 % of endpoints returning 500 | 10 m |
+| `retry_storm` | Many endpoints failing simultaneously — retry backoff and DLQ growth | 10 m |
+| `dlq_replay` | DLQ replay running concurrently with live delivery | 10 m |
+
+```bash
+# Sustained load with 80 % failing endpoints (default)
+k6 run -e SCENARIO=sustained -e FAILURE_RATE=0.8 tests/load/webhook_delivery.js
+
+# Retry storm — all endpoints failing at once
+k6 run -e SCENARIO=retry_storm -e FAILURE_RATE=1.0 tests/load/webhook_delivery.js
+
+# DLQ replay under concurrent load
+k6 run -e SCENARIO=dlq_replay -e DLQ_REPLAY_RATE=5 tests/load/webhook_delivery.js
+```
+
+#### Retry Storm
+
+Simulates a receiver outage where 80 % (or more) of endpoints return `500` simultaneously. The pipeline must absorb the retries without unbounded DLQ growth or starving successful deliveries.
+
+Watch for:
+- `webhook_dlq_depth` climbing monotonically — indicates retries are not being drained
+- `webhook_retry_backoff_seconds` saturating at the max backoff — indicates persistent failure
+- Successful delivery latency rising even though only 20 % of endpoints succeed
+
+#### Sustained Load (10 min)
+
+Runs a 10-minute steady load with `FAILURE_RATE` of endpoints returning 500. This is the primary SLO gate for the webhook pipeline.
+
+**SLOs:**
+
+| Metric | Threshold | k6 expression |
+|---|---|---|
+| DLQ depth | < 1000 | `webhook_dlq_depth: ['p(95)<1000', 'max<1000']` |
+| Successful delivery p99 | < 5 s | `webhook_delivery_success_duration: ['p(99)<5000']` |
+| Delivery error rate | < 5 % | `webhook_delivery_errors: ['rate<0.05']` |
+
+#### DLQ Replay Under Concurrent Load
+
+Issues `DLQ_REPLAY_RATE` replay requests per second against the admin replay endpoint while live delivery continues. Verifies that replaying the DLQ does not starve new deliveries and that the DLQ drains rather than grows.
+
+Watch for:
+- `webhook_dlq_depth` failing to decrease — replay is not keeping up with new failures
+- `webhook_delivery_success_duration` p99 exceeding 5 s — replay is competing with live delivery
+- Replay endpoint returning 429/503 — admin rate limit is too tight for the configured `DLQ_REPLAY_RATE`
+
+#### Webhook SLO Thresholds
+
+The script declares these thresholds in its `options.thresholds` block; a run that breaches any of them exits non-zero and fails CI:
+
+```js
+thresholds: {
+  // DLQ must not grow unbounded under sustained failure
+  webhook_dlq_depth: ['p(95)<1000', 'max<1000'],
+  // Successful deliveries must still complete quickly
+  webhook_delivery_success_duration: ['p(99)<5000'],
+  // Overall delivery error rate
+  webhook_delivery_errors: ['rate<0.05'],
+}
+```
+
+**Interpreting failures:**
+
+| Failing threshold | Likely cause | Action |
+|---|---|---|
+| `webhook_dlq_depth` | Retries not draining; backoff too aggressive or worker pool too small | Increase webhook worker concurrency; check `WEBHOOK_MAX_RETRIES` |
+| `webhook_delivery_success_duration` | Replay or retry storm competing with live delivery | Reduce `DLQ_REPLAY_RATE`; scale webhook workers |
+| `webhook_delivery_errors` | Receiver rejecting requests or pipeline saturated | Check receiver logs and `soroban_pulse_webhook_failures_total` |
+
 ---
 
 ## Performance Budgets
@@ -420,6 +500,9 @@ Check `soroban_pulse_webhook_failures_total` in the Grafana dashboard.
 | Soak (24 h) | 500 ms | 1 % |
 | Multi-contract queries | 400 ms | 1 % |
 | Webhook delivery | 1 000 ms | 5 % |
+| Webhook successful delivery (sustained, 80 % failures) | 5 000 ms | 5 % |
+| Webhook DLQ depth (sustained, 10 min) | < 1 000 entries | — |
+| Webhook DLQ replay (concurrent load) | 5 000 ms | 5 % |
 
 These budgets are enforced as CI gates. A job that exceeds a budget exits with code 1 and blocks the merge.
 

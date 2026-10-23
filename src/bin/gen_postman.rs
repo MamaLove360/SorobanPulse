@@ -17,6 +17,9 @@
 //!
 //!   # Dry-run: print collection JSON to stdout
 //!   cargo run --bin gen_postman -- --dry-run
+// Issue #1246: a panic in production is a silent availability incident.
+// Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use serde_json::{json, Map, Value};
 use std::{

@@ -53,6 +53,9 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*", "benches/**", "fuzz/**", "migrations/**"]'), github.event.pull_request.changed_files)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -63,31 +66,57 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*", "deny.toml"]'), github.event.pull_request.changed_files)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Single invocation so advisories, bans, licenses and sources are all
+      # enforced against the repo's deny.toml (GPL/AGPL denied, unmaintained
+      # and vulnerability advisories denied).
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
-          command: check advisories
-          arguments: --all-features
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check bans
-          arguments: --all-features
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check licenses
-          arguments: --all-features
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check sources
-          arguments: --all-features
+          command: check all
+          arguments: --all-features --config deny.toml
 
   check-migrations:
     name: Check Migrations
     runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["migrations/**", "scripts/check-migrations.sh"]'), github.event.pull_request.changed_files)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: bash scripts/check-migrations.sh
+
+  migration-roundtrip:
+    name: Migration Round-Trip (up + down)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["migrations/**", "scripts/migration-roundtrip.sh"]'), github.event.pull_request.changed_files)
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: soroban_pulse_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli
+      - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev
+      - name: Run migration round-trip
+        run: bash scripts/migration-roundtrip.sh migrations
+=======
 
   validate-sdk:
     name: Validate SDKs
@@ -156,6 +185,9 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*", "benches/**"]'), github.event.pull_request.changed_files)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -167,9 +199,55 @@ jobs:
       # Build with the committed .sqlx cache so query macros are verified without a live DB.
       - run: SQLX_OFFLINE=true cargo clippy -- -D warnings
 
+  build-tests:
+    name: Build Tests (cargo-nextest)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*", "migrations/**", ".sqlx/**"]'), github.event.pull_request.changed_files)
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: soroban_pulse_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: stable-nextest
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .sqlx
+          key: ${{ runner.os }}-sqlx-${{ hashFiles('.sqlx/**') }}
+          restore-keys: ${{ runner.os }}-sqlx-
+      - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev
+      - uses: taiki-e/install-action@nextest
+      - name: Run sqlx prepare check
+        run: cargo sqlx prepare --check
+      - name: Build test archive
+        run: cargo nextest archive --archive-file nextest-archive.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+
   sqlx-prepare-check:
     name: sqlx prepare --check
     runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*", "migrations/**", ".sqlx/**"]'), github.event.pull_request.changed_files)
     services:
       postgres:
         image: postgres:15
@@ -212,6 +290,9 @@ jobs:
     # (quantum-crypto, istio, linkerd, full-observability, kafka, sqs, pubsub).
     # `--each-feature` checks every feature on its own plus --no-default-features.
     runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "Cargo.*"]'), github.event.pull_request.changed_files)
     services:
       postgres:
         image: postgres:16
@@ -239,12 +320,39 @@ jobs:
       - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev cmake
       # sqlx `query!` macros are checked against the live schema at compile time.
       - run: sqlx migrate run
+      # 1. Check every feature in isolation (catches missing cfg guards).
       - run: cargo hack check --each-feature --no-dev-deps
+      # 2. Build each feature explicitly so linker errors (not caught by `check`)
+      #    are also surfaced.  These mirror the combinations described in
+      #    docs/features.md.
+      - name: Build – default features
+        run: cargo build --features "dashboard,classical-crypto"
+      - name: Build – quantum-crypto
+        run: cargo build --no-default-features --features "quantum-crypto"
+      - name: Build – hybrid-crypto
+        run: cargo build --no-default-features --features "hybrid-crypto"
+      - name: Build – istio
+        run: cargo build --no-default-features --features "classical-crypto,istio"
+      - name: Build – linkerd
+        run: cargo build --no-default-features --features "classical-crypto,linkerd"
+      - name: Build – full-observability
+        run: cargo build --no-default-features --features "classical-crypto,full-observability"
+      - name: Build – kafka
+        run: cargo build --no-default-features --features "classical-crypto,kafka"
+      - name: Build – sqs
+        run: cargo build --no-default-features --features "classical-crypto,sqs"
+      - name: Build – pubsub
+        run: cargo build --no-default-features --features "classical-crypto,pubsub"
+      - name: Build – kafka + sqs fan-out combination
+        run: cargo build --no-default-features --features "classical-crypto,kafka,sqs"
 
   test:
     name: Test (rust stable, pg ${{ matrix.postgres }})
     runs-on: ubuntu-latest
     needs: build-tests
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*", "migrations/**"]'), github.event.pull_request.changed_files)
     permissions:
       contents: read
       checks: write
@@ -273,6 +381,9 @@ jobs:
         with:
           name: nextest-archive
       - run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --profile ci
+        env:
+          # Property-based tests for the subscription filter engine run 50k cases.
+          PROPTEST_CASES: 50000
       - name: Publish test report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -320,6 +431,8 @@ jobs:
       - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --profile ci
+        env:
+          PROPTEST_CASES: 50000
       - name: Publish test report
         if: always()
         uses: mikepenz/action-junit-report@v5
@@ -331,6 +444,9 @@ jobs:
     name: Coverage Report
     runs-on: ubuntu-latest
     continue-on-error: true
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*"]'), github.event.pull_request.changed_files)
     services:
       postgres:
         image: postgres:15
@@ -409,10 +525,15 @@ jobs:
         include:
           - name: Integration Tests
             binary: integration_tests
+          - name: Admin Endpoint Tests
+            binary: admin_tests
           - name: Resilience Tests
             binary: resilience
           - name: Chaos Engineering Tests
             binary: chaos_tests
+          - name: Chaos Engineering Tests (chaos feature)
+            binary: chaos_tests
+            features: chaos
     services:
       postgres:
         image: postgres:15
@@ -432,7 +553,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: nextest-archive
-      - run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --profile ci -E 'binary(${{ matrix.binary }})'
+      - name: Run ${{ matrix.name }}
+        if: matrix.features == ''
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --profile ci -E 'binary(${{ matrix.binary }})'
+      - name: Run ${{ matrix.name }}
+        if: matrix.features != ''
+        run: cargo test --features ${{ matrix.features }} --test ${{ matrix.binary }}
       - name: Publish test report
         if: always()
         uses: mikepenz/action-junit-report@v5
@@ -441,10 +567,60 @@ jobs:
           check_name: ${{ matrix.name }} report
           annotate_only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
+  multi-tenant-rls:
+    # Issue #1344: run the multi-tenant isolation suite, including the
+    # row-level security tests, against a real PostgreSQL instance. The
+    # `postgres` service user is a superuser, which the RLS tests need to
+    # create throwaway non-superuser application roles.
+    name: Multi-Tenant RLS Isolation (pg ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    needs: build-tests
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*", "migrations/**"]'), github.event.pull_request.changed_files)
+    permissions:
+      contents: read
+      checks: write
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15", "16"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: soroban_pulse_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+      - name: Run multi-tenant isolation tests
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --profile ci -E 'binary(multi_tenant_isolation_tests)'
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: target/nextest/ci/junit.xml
+          check_name: Multi-Tenant RLS Isolation report (pg ${{ matrix.postgres }})
+          annotate_only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+
   bench:
     name: Bench (non-blocking)
     runs-on: ubuntu-latest
     continue-on-error: true
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "benches/**", "Cargo.*"]'), github.event.pull_request.changed_files)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -506,6 +682,40 @@ jobs:
           path: fuzz/corpus/
           retention-days: 30
 
+  check-env-docs:
+    name: Check Env Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Verify docs/configuration.md is in sync with src/config.rs
+        run: cargo run --bin gen_env_docs -- --check
+
+  check-mdbook:
+    name: Check mdBook Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdbook
+        run: |
+          mkdir -p ~/.local/bin
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz --directory ~/.local/bin
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install mdbook-admonish
+        run: |
+          curl -sSL https://github.com/tommilligan/mdbook-admonish/releases/download/v1.18.0/mdbook-admonish-v1.18.0-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz --directory ~/.local/bin
+      - name: Install mdbook-mermaid
+        run: |
+          curl -sSL https://github.com/badboy/mdbook-mermaid/releases/download/v0.13.0/mdbook-mermaid-v0.13.0-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz --directory ~/.local/bin
+      - name: Build mdBook (must succeed without warnings)
+        run: mdbook build 2>&1 | tee /tmp/mdbook-build.log; grep -i "warning\|error" /tmp/mdbook-build.log && exit 1 || true
+
   build:
     name: Release Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -538,10 +748,49 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          tags: soroban-pulse:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Enforce image size limit (80 MB)
+        run: |
+          size=$(docker image inspect --format='{{.Size}}' soroban-pulse:ci)
+          limit=83886080
+          echo "Image size: ${size} bytes (limit: ${limit} bytes)"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::Docker image is $((size / 1024 / 1024)) MB, exceeding the 80 MB limit"
+            exit 1
+          fi
     # Actual publish (tagging, scanning, SBOM) happens in docker-publish.yml
     # on push to main / version tags — kept separate so PR feedback here stays fast.
+
+  network-policy:
+    name: NetworkPolicy (kind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Create kind cluster
+        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          cluster_name: soroban-pulse
+      - name: Apply manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml || kubectl create namespace soroban-pulse
+          kubectl apply -f k8s/network-policy.yaml
+      - name: Verify ingress is denied from another namespace
+        run: |
+          kubectl create namespace attacker
+          kubectl run attacker --image=busybox:1.36 --restart=Never -n attacker -- sleep 3600
+          kubectl wait --for=condition=Ready pod/attacker -n attacker --timeout=120s
+          # The SorobanPulse pod is not running in this smoke test, so assert the
+          # policy object exists and selects the app pods.
+          kubectl get networkpolicy -n soroban-pulse -o yaml
+          kubectl get networkpolicy -n soroban-pulse -o jsonpath='{.items[*].spec.podSelector}' | grep -q . 
+      - name: Verify egress rules (DB 5432, RPC 443, DNS 53)
+        run: |
+          kubectl get networkpolicy -n soroban-pulse -o jsonpath='{.items[*].spec.egress}' | grep -q 5432
+          kubectl get networkpolicy -n soroban-pulse -o jsonpath='{.items[*].spec.egress}' | grep -q 443
+          kubectl get networkpolicy -n soroban-pulse -o jsonpath='{.items[*].spec.egress}' | grep -q 53
 
   helm-lint:
     name: Helm Chart Lint
@@ -607,9 +856,27 @@ jobs:
       - name: Validate OpenAPI spec
         run: spectral lint openapi.json --ruleset https://unpkg.com/@stoplight/spectral-openapi/dist/ruleset.js
 
+  config-docs:
+    name: Configuration Reference Up To Date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - run: sudo apt-get install -y pkg-config libssl-dev
+      # Fails when docs/configuration.md or .env.example are stale, or when
+      # src/config.rs reads a variable missing from src/config/reference.rs.
+      - name: Check generated configuration docs
+        run: cargo run --bin gen_config_docs -- --check
+
   terraform-validate:
     name: Terraform Validate
     runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["terraform/**"]'), github.event.pull_request.changed_files)
     defaults:
       run:
         working-directory: terraform
@@ -635,3 +902,55 @@ jobs:
 
       - name: TFLint
         run: tflint --init && tflint --recursive
+
+  # Mandatory check job that always runs to keep branch protection happy
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - fmt
+      - deny
+      - check-migrations
+      - migration-roundtrip
+      - validate-sdk
+      - web
+      - extension
+      - clippy
+      - build-tests
+      - sqlx-prepare-check
+      - features
+      - test
+      - test-beta
+      - coverage
+      - contract-tests
+      - suite-tests
+      - multi-tenant-rls
+      - bench
+      - mutants
+      - fuzz
+      - build
+      - docker
+      - network-policy
+      - helm-lint
+      - check-api-types
+      - openapi
+      - config-docs
+      - terraform-validate
+    steps:
+      - name: Check all required jobs
+        run: |
+          # Check if any required job failed
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi
+          
+          # Check if any required job was cancelled
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more required jobs were cancelled"
+            exit 1
+          fi
+          
+          echo "All required jobs passed or were skipped"
+

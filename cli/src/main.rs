@@ -3,6 +3,7 @@ mod config;
 mod exporter;
 mod formatter;
 mod query;
+mod replay;
 mod subscription;
 mod tail;
 mod webhook_test;
@@ -156,7 +157,7 @@ enum Commands {
         shell: clap_complete::Shell,
     },
 
-    /// Stream live events as NDJSON (one JSON object per line)
+    /// Stream live events as NDJSON with color-coded output (one JSON object per line)
     Tail {
         /// Contract ID to stream events for
         #[arg(long, short = 'c')]
@@ -164,6 +165,19 @@ enum Commands {
         /// Filter: event type (contract, diagnostic, system)
         #[arg(long = "type", short = 't')]
         event_type: Option<String>,
+        /// Disable color output
+        #[arg(long)]
+        no_color: bool,
+    },
+
+    /// Trigger a ledger replay and monitor progress
+    Replay {
+        /// Starting ledger sequence
+        #[arg(long)]
+        from_ledger: i64,
+        /// Ending ledger sequence (optional)
+        #[arg(long)]
+        to_ledger: Option<i64>,
     },
 
     /// Send a synthetic test event to a webhook URL and report the result
@@ -359,9 +373,14 @@ fn run() -> Result<()> {
 
         Commands::Subscriptions { action } => handle_subscription(&cfg, action)?,
 
-        Commands::Tail { contract, event_type } => {
+        Commands::Tail { contract, event_type, no_color } => {
             let client = ApiClient::new(&cfg)?;
-            tail::run(&client, &contract, event_type.as_deref())?;
+            tail::run(&client, &contract, event_type.as_deref(), no_color)?;
+        }
+
+        Commands::Replay { from_ledger, to_ledger } => {
+            let client = ApiClient::new(&cfg)?;
+            replay::run(&client, from_ledger, to_ledger)?;
         }
 
         Commands::WebhookTest { url, contract, timeout } => {

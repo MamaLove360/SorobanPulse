@@ -108,6 +108,28 @@ groups:
           description: "No events indexed in the last 10 minutes. This may be expected during low-activity periods on the network, but could also indicate an indexer stall. Verify network activity and check indexer logs."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/indexer-lag.md"
 
+      # #1327: RPC retention gap detection — fires when the indexed ledger sequence
+      # jumps by more than 17,000 in a single 5-minute window. A jump this large
+      # means the RPC node has rolled past its retention window and the indexer
+      # skipped ahead without indexing the missed events.
+      # 17,000 ledgers ≈ ~23.6 h at a 5-second ledger close time, just below the
+      # 17,280-ledger (~24 h) default retention window.
+      - alert: LedgerSequenceDiscontinuity
+        expr: increase(soroban_pulse_indexer_current_ledger[5m]) > 17000
+        for: 0m
+        labels:
+          severity: critical
+          component: indexer
+        annotations:
+          summary: "Soroban Pulse indexer skipped a large ledger range — possible RPC retention gap"
+          description: >-
+            The indexed ledger sequence increased by {{ $value | humanize }} in a single 5-minute
+            window. A jump larger than ~17,000 indicates the RPC node has rolled past its retention
+            window and the indexer advanced past a gap without indexing the missing events.
+            Follow the RPC retention gap runbook to determine whether to replay from Galexie or
+            accept the gap.
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/rpc-retention-gap.md"
+
       - alert: HTTPRequestLatencyHigh
         expr: histogram_quantile(0.95, rate(soroban_pulse_http_request_duration_seconds_bucket[5m])) > 1
         for: 5m
@@ -179,6 +201,27 @@ groups:
           summary: "Notification delivery p99 latency exceeds 60s"
           description: "The p99 notification delivery latency for channel {{ $labels.channel }} is {{ $value | humanizeDuration }}. Investigate notification queue depth and downstream webhook/email endpoint health."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/notifications.md"
+
+      # #1328: Notification delivery success rate alert
+      - alert: NotificationDeliverySuccessRateLow
+        expr: |
+          (
+            sum(rate(soroban_pulse_notification_delivery_success_total[5m]))
+            /
+            (
+              sum(rate(soroban_pulse_notification_delivery_success_total[5m]))
+              +
+              sum(rate(soroban_pulse_notification_delivery_failure_total[5m]))
+            )
+          ) < 0.95
+        for: 5m
+        labels:
+          severity: critical
+          component: notifications
+        annotations:
+          summary: "Notification delivery success rate below 95%"
+          description: "Only {{ $value | humanizePercentage }} of notification deliveries succeeded over the last 5 minutes (threshold: 95%). A notification channel may be down; follow the channel failover procedure."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/notifications.md#channel-failover"
 
       # #586: Replica sync monitoring alerts
       - alert: ReplicaLagHigh
@@ -304,3 +347,112 @@ groups:
           summary: "Error rate approaching feature flag rollback threshold"
           description: "Current error rate is {{ $value | humanizePercentage }} (rollback threshold 5%). Feature flags with auto_rollback enabled may be disabled soon."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/feature-flag-rollback.md"
+
+      # #1263: Incident correlation alerts
+      - alert: IncidentsOpen
+        expr: soroban_pulse_incidents_open > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: incident_correlation
+        annotations:
+          summary: "Soroban Pulse has open correlated incidents"
+          description: "{{ $value }} incident(s) remain open for more than 5 minutes. Correlated anomaly alerts, RPC errors, and indexer lag have been grouped into incidents. Review them via GET /v1/admin/incidents and investigate the underlying signals."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/incident-correlation.md"
+
+      - alert: IncidentCreationSpike
+        expr: increase(soroban_pulse_incidents_created_total[10m]) >= 3
+        for: 0m
+        labels:
+          severity: critical
+          component: incident_correlation
+        annotations:
+          summary: "Multiple correlated incidents created in a short window"
+          description: "{{ $value }} incident(s) were created in the last 10 minutes, indicating a burst of correlated anomaly events (RPC errors, indexer lag, or anomaly alerts). Check GET /v1/admin/incidents and the indexer/RPC health dashboards."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/incident-correlation.md"
+
+      # SSE connection monitoring
+      - alert: SSEConnectionErrorRateHigh
+        expr: |
+          (rate(soroban_pulse_sse_connections_total{result="error"}[5m]) /
+           (rate(soroban_pulse_sse_connections_total[5m]) + 0.001)) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: sse
+        annotations:
+          summary: "SSE connection error rate is above 5%"
+          description: "SSE error rate is {{ $value | humanizePercentage }} (threshold: 5%). More than 5% of SSE connections are encountering errors. Check client logs and inspect recent SSE connection attempts."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/sse-reconnection.md"
+
+      - alert: SSEConnectionErrorRateCritical
+        expr: |
+          (rate(soroban_pulse_sse_connections_total{result="error"}[5m]) /
+           (rate(soroban_pulse_sse_connections_total[5m]) + 0.001)) > 0.10
+        for: 2m
+        labels:
+          severity: critical
+          component: sse
+        annotations:
+          summary: "SSE connection error rate is critical (>10%)"
+          description: "SSE error rate is {{ $value | humanizePercentage }} (threshold: 10%). SSE service degradation detected. Investigate immediately."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/sse-reconnection.md"
+
+      - alert: UnifiedErrorRateHigh
+        expr: |
+          (rate(soroban_pulse_errors_total[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: observability
+        annotations:
+          summary: "Unified error rate is above 10/sec"
+          description: "Error rate across all subsystems (RPC, webhook, email, DB, SSE) is {{ $value | humanize }} errors/sec. Check which error kind is elevated: {{ $labels.kind }}"
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/troubleshooting.md"
+
+      - alert: WebhookErrorRateHigh
+        expr: |
+          rate(soroban_pulse_errors_total{kind="webhook"}[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: webhooks
+        annotations:
+          summary: "Webhook error rate is above 1/sec"
+          description: "Webhook errors: {{ $value | humanize }}/sec over 5 minutes. Check webhook delivery logs and network connectivity to webhook endpoints."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/webhook-logging.md"
+
+      - alert: EmailErrorRateHigh
+        expr: |
+          rate(soroban_pulse_errors_total{kind="email"}[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: email
+        annotations:
+          summary: "Email delivery error rate is above 0.5/sec"
+          description: "Email errors: {{ $value | humanize }}/sec over 5 minutes. Check SMTP relay connectivity and bounce logs."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/email-notifications.md"
+
+      - alert: DatabaseErrorRateHigh
+        expr: |
+          rate(soroban_pulse_errors_total{kind="db"}[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Database error rate is above 0.1/sec"
+          description: "Database errors: {{ $value | humanize }}/sec over 5 minutes. Check PostgreSQL health: replication lag, connection pool saturation, and slow query logs."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/pool-optimization.md"
+
+      - alert: PartitionPruningStalled
+        expr: increase(soroban_pulse_partitions_dropped_total[24h]) == 0
+        for: 0m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Partition pruning has not run in 24 hours"
+          description: "No partitions have been dropped in the last 24 hours. Partition pruning may be stalled or disabled. Check: (1) DATA_RETENTION_DAYS is set, (2) pruner job is healthy, (3) drop_old_partitions function exists."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/data-retention.md#partition-lifecycle-and-pruning"

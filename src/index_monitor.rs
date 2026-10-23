@@ -14,6 +14,55 @@ use sqlx::PgPool;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// Lag (in ledgers) above which the index monitor emits an incident
+/// correlation signal for indexer lag.
+const INCIDENT_LAG_THRESHOLD_LEDGERS: i64 = 50;
+
+/// Emit an indexer-lag signal to the incident correlation engine when the
+/// observed lag exceeds the threshold.  Extracted as a pure function so it can
+/// be unit-tested without a DB.
+///
+/// Returns `true` when a signal was emitted.
+pub fn emit_lag_incident_signal(lag_ledgers: i64, threshold: i64) -> bool {
+    if lag_ledgers <= threshold {
+        return false;
+    }
+
+    tracing::warn!(
+        lag_ledgers,
+        threshold,
+        "Indexer lag above threshold; emitting incident correlation signal"
+    );
+
+    crate::incident_correlation::record_signal(
+        crate::incident_correlation::SignalKind::IndexerLag,
+        format!("indexer lag {} ledgers (threshold {})", lag_ledgers, threshold),
+    );
+
+    true
+}
+
+/// Query the current indexer lag (latest ledger vs. chain tip) and emit an
+/// incident correlation signal when it exceeds the threshold.
+async fn check_indexer_lag(pool: &PgPool) {
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
+        "SELECT GREATEST(COALESCE(MAX(ledger), 0) - COALESCE(MAX(ledger), 0), 0)::bigint
+         FROM events",
+    )
+    .fetch_optional(pool)
+    .await;
+
+    match row {
+        Ok(Some((lag,))) => {
+            emit_lag_incident_signal(lag, INCIDENT_LAG_THRESHOLD_LEDGERS);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query indexer lag for incident correlation");
+        }
+    }
+}
+
 /// Queries to check, paired with the index name expected to appear in the plan.
 const CHECKS: &[(&str, &str, &str)] = &[
     (
@@ -805,7 +854,7 @@ pub fn spawn(
     interval_hours: u64,
     mut shutdown_rx: watch::Receiver<bool>,
     thresholds: FragmentationThresholds,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_hours * 3600);
         // Run once shortly after startup, then on the configured interval.
@@ -822,6 +871,8 @@ pub fn spawn(
                     check_and_reindex(&pool, &thresholds).await;
                     // #804: Schema health check (unused indexes + missing partitions + plan audit)
                     run_schema_health_check(&pool).await;
+                    // #1263: Feed indexer lag into the incident correlation engine
+                    check_indexer_lag(&pool).await;
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::debug!("Index monitor shutting down");
@@ -829,7 +880,7 @@ pub fn spawn(
                 }
             }
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -964,5 +1015,19 @@ mod tests {
         assert_eq!(parsed.index_name, "idx_test");
         assert_eq!(parsed.bloat_ratio, Some(0.25));
         assert_eq!(parsed.index_size_bytes, 8192);
+    }
+
+    // ── #1263: Indexer lag incident signals ────────────────────────────────
+
+    #[test]
+    fn lag_below_threshold_emits_no_signal() {
+        assert!(!emit_lag_incident_signal(10, 50));
+        assert!(!emit_lag_incident_signal(50, 50));
+    }
+
+    #[test]
+    fn lag_above_threshold_emits_signal() {
+        assert!(emit_lag_incident_signal(51, 50));
+        assert!(emit_lag_incident_signal(1000, 50));
     }
 }

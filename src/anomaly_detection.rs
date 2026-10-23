@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 use uuid::Uuid;
 use tracing::{info, error, warn};
 
+use crate::incident_correlation::{self, CorrelationSignal, SignalKind};
+
 /// Anomaly detection method
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum DetectionMethod {
@@ -308,6 +310,33 @@ pub async fn record_anomaly_alert(
         "Anomaly detected and alerted"
     );
 
+    // Feed the anomaly into the incident correlation engine. Failure to
+    // correlate must not fail alert recording, so errors are only logged.
+    let signal = CorrelationSignal {
+        subscription_id,
+        kind: SignalKind::Anomaly,
+        source: metric_name.clone(),
+        severity: severity.to_string(),
+        observed_at: Utc::now(),
+        details: serde_json::json!({
+            "alert_id": alert_id,
+            "event_id": event_id,
+            "metric_name": metric_name,
+            "metric_value": metric_value,
+            "anomaly_score": anomaly_score,
+            "detection_method": method_str,
+        }),
+    };
+
+    if let Err(e) = incident_correlation::ingest_signal(pool, signal).await {
+        error!(
+            alert_id = %alert_id,
+            subscription_id = %subscription_id,
+            error = %e,
+            "Failed to correlate anomaly signal into incidents"
+        );
+    }
+
     Ok(AnomalyAlertResponse {
         alert_id,
         metric_name,
@@ -437,6 +466,190 @@ mod tests {
         assert_eq!(calculate_percentile(&values, 0.5), 3.0); // median
         assert_eq!(calculate_percentile(&values, 0.25), 2.0); // Q1
         assert_eq!(calculate_percentile(&values, 0.75), 4.0); // Q3
+    }
+
+    #[test]
+    fn test_percentile_empty_and_single() {
+        assert_eq!(calculate_percentile(&[], 0.5), 0.0);
+        assert_eq!(calculate_percentile(&[42.0], 0.5), 42.0);
+        assert_eq!(calculate_percentile(&[42.0], 0.99), 42.0);
+    }
+
+    /// Build a baseline from raw samples using the same statistics as
+    /// `calculate_baseline`, without touching the database.
+    fn baseline_from_samples(samples: &[f64]) -> BaselineStatistics {
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+            / samples.len() as f64;
+        let std_dev = variance.sqrt();
+
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let median = calculate_percentile(&sorted, 0.5);
+        let deviations: Vec<f64> = sorted.iter().map(|x| (x - median).abs()).collect();
+
+        BaselineStatistics {
+            id: Uuid::new_v4(),
+            subscription_id: Uuid::new_v4(),
+            metric_name: "test".to_string(),
+            mean,
+            std_dev,
+            min: sorted[0],
+            max: sorted[sorted.len() - 1],
+            median,
+            q1: calculate_percentile(&sorted, 0.25),
+            q3: calculate_percentile(&sorted, 0.75),
+            mad: calculate_percentile(&deviations, 0.5),
+            sample_count: samples.len() as i64,
+            training_window_days: 30,
+            last_updated: Utc::now(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_baseline_training_statistics() {
+        let samples = [10.0, 12.0, 14.0, 16.0, 18.0];
+        let baseline = baseline_from_samples(&samples);
+
+        assert!((baseline.mean - 14.0).abs() < 1e-9);
+        assert!((baseline.std_dev - 8.0_f64.sqrt()).abs() < 1e-9);
+        assert_eq!(baseline.min, 10.0);
+        assert_eq!(baseline.max, 18.0);
+        assert_eq!(baseline.median, 14.0);
+        assert_eq!(baseline.q1, 12.0);
+        assert_eq!(baseline.q3, 16.0);
+        assert_eq!(baseline.mad, 2.0);
+        assert_eq!(baseline.sample_count, 5);
+    }
+
+    #[test]
+    fn test_baseline_constant_samples_have_zero_spread() {
+        let baseline = baseline_from_samples(&[5.0; 20]);
+        assert_eq!(baseline.mean, 5.0);
+        assert_eq!(baseline.std_dev, 0.0);
+        assert_eq!(baseline.mad, 0.0);
+        assert_eq!(baseline.min, 5.0);
+        assert_eq!(baseline.max, 5.0);
+    }
+
+    #[test]
+    fn test_zscore_spike_and_drop_detection() {
+        let baseline = baseline_from_samples(&[100.0, 102.0, 98.0, 101.0, 99.0]);
+
+        // Spike above the upper threshold.
+        assert!(detect_zscore_anomaly(&baseline, 200.0, 3.0).is_some());
+        // Drop below the lower threshold.
+        assert!(detect_zscore_anomaly(&baseline, 0.0, 3.0).is_some());
+        // Normal value.
+        assert!(detect_zscore_anomaly(&baseline, 100.0, 3.0).is_none());
+    }
+
+    #[test]
+    fn test_iqr_spike_and_drop_detection() {
+        let baseline = baseline_from_samples(&[10.0, 20.0, 30.0, 40.0, 50.0]);
+
+        // Spike above upper bound.
+        assert!(detect_iqr_anomaly(&baseline, 1000.0, 1.5).is_some());
+        // Drop below lower bound.
+        assert!(detect_iqr_anomaly(&baseline, -1000.0, 1.5).is_some());
+        // Within bounds.
+        assert!(detect_iqr_anomaly(&baseline, 30.0, 1.5).is_none());
+    }
+
+    #[test]
+    fn test_mad_spike_and_drop_detection() {
+        let baseline = baseline_from_samples(&[10.0, 11.0, 12.0, 13.0, 14.0]);
+
+        assert!(detect_mad_anomaly(&baseline, 100.0, 3.5).is_some());
+        assert!(detect_mad_anomaly(&baseline, -100.0, 3.5).is_some());
+        assert!(detect_mad_anomaly(&baseline, 12.0, 3.5).is_none());
+    }
+
+    #[test]
+    fn test_zero_spread_never_panics_or_alerts() {
+        let baseline = baseline_from_samples(&[7.0; 10]);
+        assert!(detect_zscore_anomaly(&baseline, 1000.0, 3.0).is_none());
+        assert!(detect_mad_anomaly(&baseline, 1000.0, 3.5).is_none());
+        // IQR is zero, so bounds collapse to the median; a far value is still flagged.
+        assert!(detect_iqr_anomaly(&baseline, 1000.0, 1.5).is_some());
+        assert!(detect_iqr_anomaly(&baseline, 7.0, 1.5).is_none());
+    }
+
+    #[test]
+    fn test_threshold_configuration_changes_outcome() {
+        let baseline = baseline_from_samples(&[100.0, 102.0, 98.0, 101.0, 99.0]);
+
+        // 150 is ~25 std devs out: flagged at any sane threshold.
+        assert!(detect_zscore_anomaly(&baseline, 150.0, 3.0).is_some());
+        // A very high threshold suppresses the alert.
+        assert!(detect_zscore_anomaly(&baseline, 150.0, 1000.0).is_none());
+
+        // IQR multiplier controls sensitivity.
+        let iqr_baseline = baseline_from_samples(&[10.0, 20.0, 30.0, 40.0, 50.0]);
+        assert!(detect_iqr_anomaly(&iqr_baseline, 100.0, 1.5).is_some());
+        assert!(detect_iqr_anomaly(&iqr_baseline, 100.0, 100.0).is_none());
+    }
+
+    /// Minimal cooldown tracker mirroring the alert de-duplication behaviour.
+    struct Cooldown {
+        window: Duration,
+        last: Option<DateTime<Utc>>,
+    }
+
+    impl Cooldown {
+        fn new(window: Duration) -> Self {
+            Self { window, last: None }
+        }
+
+        fn should_alert(&mut self, now: DateTime<Utc>) -> bool {
+            match self.last {
+                Some(prev) if now - prev < self.window => false,
+                _ => {
+                    self.last = Some(now);
+                    true
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cooldown_suppresses_duplicate_alerts() {
+        let mut cooldown = Cooldown::new(Duration::minutes(5));
+        let start = Utc::now();
+
+        assert!(cooldown.should_alert(start));
+        assert!(!cooldown.should_alert(start + Duration::minutes(1)));
+        assert!(!cooldown.should_alert(start + Duration::minutes(4)));
+        // After the window elapses, alerting resumes.
+        assert!(cooldown.should_alert(start + Duration::minutes(6)));
+        assert!(!cooldown.should_alert(start + Duration::minutes(7)));
+    }
+
+    #[test]
+    fn test_identical_rates_never_alert_property() {
+        // Deterministic sweep over many constant-rate sequences.
+        for rate in 0..500 {
+            let value = rate as f64;
+            let samples = vec![value; 30];
+            let baseline = baseline_from_samples(&samples);
+
+            assert!(detect_zscore_anomaly(&baseline, value, 3.0).is_none());
+            assert!(detect_mad_anomaly(&baseline, value, 3.5).is_none());
+            assert!(detect_iqr_anomaly(&baseline, value, 1.5).is_none());
+        }
+    }
+
+    #[test]
+    fn test_identical_rates_with_noise_never_alert_property() {
+        // Constant rate with tiny floating-point jitter must not alert either.
+        for rate in 0..200 {
+            let base = rate as f64;
+            let samples: Vec<f64> = (0..30).map(|i| base + (i as f64) * 1e-9).collect();
+            let baseline = baseline_from_samples(&samples);
+            assert!(detect_zscore_anomaly(&baseline, base, 3.0).is_none());
+        }
     }
 }
 

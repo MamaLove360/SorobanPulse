@@ -1,5 +1,7 @@
 # API Contract Testing with Pact (Issue #556)
 
+> This guide merges the former `api-contract-testing.md` (Issue #1170).
+
 ## Overview
 
 Contract testing ensures that API clients and servers implement the same contract. This prevents integration failures where the server and clients have incompatible expectations about request/response formats.
@@ -462,6 +464,303 @@ Before merging API changes:
 - [ ] Documentation is updated
 - [ ] Contract pacts are published to broker
 - [ ] Consumer integration tests pass
+
+## Contract Suite Reference
+
+### Test Organization
+
+Contract tests are organized by API domain in `tests/pact_contract_tests.rs`:
+
+#### 1. Events API Contracts (`events_api_contracts`)
+
+**Tests:**
+- `contract_get_events_success_response` - Events list format
+- `contract_get_events_with_filters` - Filtering and pagination
+- `contract_get_contract_events` - Single contract query
+- `contract_get_tx_events` - Transaction events query
+- `contract_get_events_stream` - Server-Sent Events format
+
+**Verified properties:**
+- Response contains `data`, `total`, `page`, `limit`, `approximate`
+- Pagination parameters are integers
+- Event objects include required fields: `id`, `contract_id`, `event_type`, `ledger`, `timestamp`, `created_at`
+- Filters work independently and combine correctly
+- SSE endpoint returns `Content-Type: text/event-stream`
+
+#### 2. Error Response Contracts (`error_response_contracts`)
+
+**Tests:**
+- `contract_bad_request_format` - 400 errors
+- `contract_unauthorized_format` - 401 errors
+- `contract_forbidden_format` - 403 errors
+- `contract_not_found_format` - 404 errors
+- `contract_rate_limit_exceeded_format` - 429 errors
+- `contract_internal_error_format` - 500 errors
+- `contract_service_unavailable_format` - 503 errors
+
+**Verified properties:**
+- All error responses follow the format: `{ "error": "description", "code": "error_code" }`
+- Status codes match HTTP standards
+- Rate-limit errors include `Retry-After` header
+- Error messages don't expose sensitive information
+
+#### 3. Health Check Contracts (`health_check_contracts`)
+
+**Tests:**
+- `contract_liveness_probe` - `/healthz/live` endpoint
+- `contract_readiness_probe_ready` - `/healthz/ready` when healthy
+- `contract_readiness_probe_db_down` - `/healthz/ready` when DB unavailable
+
+**Verified properties:**
+- Liveness probe always returns 200 if process is running
+- Readiness probe includes dependency status
+- Readiness probe returns 503 when database is unavailable
+
+#### 4. Subscription API Contracts (`subscription_api_contracts`)
+
+**Tests:**
+- `contract_create_subscription` - POST /v1/subscriptions
+- `contract_list_subscriptions` - GET /v1/subscriptions
+- `contract_delete_subscription_success` - DELETE /v1/subscriptions/{id}
+
+**Verified properties:**
+- Create returns subscription with ID and signing secret
+- List returns array with pagination metadata
+- Delete returns 204 No Content
+- Delete returns 404 if subscription doesn't exist
+
+#### 5. API Versioning Contracts (`api_versioning_contracts`)
+
+**Tests:**
+- `contract_versioned_endpoints` - All endpoints under /v1/
+- `contract_deprecation_headers` - Deprecation headers on old endpoints
+
+**Verified properties:**
+- All new endpoints use `/v1/` prefix
+- Unversioned endpoints include `Deprecation` and `Link` headers
+
+#### 6. NDJSON Response Contracts (`ndjson_response_contracts`)
+
+**Tests:**
+- `contract_ndjson_format` - NDJSON response format
+
+**Verified properties:**
+- `Accept: application/x-ndjson` returns proper content type
+- Responses are one JSON object per line
+
+### Common Contracts
+
+#### Pagination Schema
+
+```json
+{
+  "data": [],
+  "total": 100,
+  "page": 1,
+  "limit": 20,
+  "approximate": true
+}
+```
+
+**Contract assertions:**
+- `total` is always >= 0
+- `page` is always >= 1
+- `limit` is always between 1 and 100 (inclusive)
+- `approximate` is a boolean
+- `data` is an array (may be empty)
+
+#### Event Object Schema
+
+```json
+{
+  "id": "uuid",
+  "contract_id": "CABC...",
+  "event_type": "contract|diagnostic|system",
+  "tx_hash": "64-char hex",
+  "ledger": 1234567,
+  "timestamp": "2026-03-14T00:00:00Z",
+  "event_data": {},
+  "created_at": "2026-03-14T00:00:01Z"
+}
+```
+
+**Contract assertions:**
+- `id` is a valid UUID
+- `contract_id` is a valid Stellar contract ID (C + 55 base32 chars)
+- `event_type` is one of: contract, diagnostic, system
+- `tx_hash` is 64 lowercase hex characters
+- `ledger` is a non-negative integer
+- `timestamp` and `created_at` are ISO 8601 formatted
+- `event_data` is a valid JSON object
+
+#### Error Response Schema
+
+```json
+{
+  "error": "Human-readable error description",
+  "code": "machine_readable_code"
+}
+```
+
+**Contract assertions:**
+- `error` is a non-empty string (< 500 chars, no sensitive info)
+- `code` is a machine-readable identifier (lowercase_with_underscores)
+- Response status code matches HTTP standards
+
+### Pact Broker Integration
+
+#### Publishing Contracts
+
+To publish contracts to a Pact Broker:
+
+```bash
+# Set broker details
+export PACT_BROKER_URL=https://pact-broker.example.com
+export PACT_BROKER_TOKEN=your-token
+
+# Publish pacts from this build
+cargo test --test pact_contract_tests
+# Pacts are automatically generated in target/pacts/
+
+# Publish to broker
+pact-broker publish target/pacts \
+  --consumer-app-version=$GIT_SHA \
+  --branch=$GIT_BRANCH
+```
+
+#### Verifying Contracts
+
+Consumers use pacts to verify the server meets their expectations:
+
+```bash
+# Verify server against published consumer contracts
+pact_verifier \
+  --provider SorobanPulse \
+  --provider-base-url http://localhost:3000 \
+  --broker-url https://pact-broker.example.com \
+  --broker-token=$PACT_BROKER_TOKEN
+```
+
+### Writing New Contract Tests
+
+#### 1. Define the Request
+
+```rust
+let request = json!({
+    "method": "GET",
+    "path": "/v1/events",
+    "query": {
+        "page": 1,
+        "limit": 20
+    }
+});
+```
+
+#### 2. Define the Expected Response
+
+```rust
+let response = json!({
+    "status": 200,
+    "headers": {
+        "content-type": "application/json"
+    },
+    "body": {
+        "data": [],
+        "total": 0,
+        "page": 1,
+        "limit": 20,
+        "approximate": true
+    }
+});
+```
+
+#### 3. Document the Contract
+
+```rust
+/// Contract: GET /v1/events returns paginated list
+///
+/// When a client requests events with valid pagination,
+/// the API must return JSON with data, total, page, limit, approximate
+#[test]
+fn contract_get_events() {
+    // ...
+}
+```
+
+#### 4. Add Assertions
+
+```rust
+#[test]
+fn contract_get_events() {
+    // ... request and response definitions ...
+    
+    // Verify response schema
+    assert_eq!(response.get("status"), Some(&json!(200)));
+    assert!(response.get("body").and_then(|b| b.get("data")).is_some());
+    
+    // Verify data types
+    assert!(response.get("body")
+        .and_then(|b| b.get("total"))
+        .and_then(|t| t.as_i64())
+        .is_some());
+}
+```
+
+### Troubleshooting
+
+#### Test passes locally but fails in CI
+
+Contract tests might have assumed state or timing issues:
+
+1. Check for hardcoded UUIDs or timestamps
+2. Verify test isolation (tests shouldn't depend on order)
+3. Check for time-dependent assertions
+4. Ensure all external dependencies are mocked
+
+#### Contract conflict between client and server
+
+When a client test expects different behavior than server provides:
+
+1. **Coordinate with team** - Discuss the actual requirement
+2. **Update contracts** - Make expectations consistent
+3. **Version the API** - If changes are breaking, use /v2/
+4. **Gradual migration** - Support both old and new formats temporarily
+
+#### Pact verification fails
+
+When provider doesn't implement what consumers expect:
+
+1. **Read the verification report** - It shows which contract failed
+2. **Check the Pact file** - See exactly what consumer expects
+3. **Implement the provider** - Add the missing endpoint or fix the response
+4. **Re-verify** - Run verification again
+
+### Advanced Topics
+
+#### Provider States
+
+Provider states allow tests to set up preconditions:
+
+```rust
+// Define a provider state
+#[test]
+#[provider_state("an event exists for contract CABC123")]
+fn contract_get_contract_events() {
+    // Test assumes this event exists in the database
+}
+```
+
+#### Matching Rules
+
+Pact supports flexible matching (useful for timestamps, UUIDs):
+
+```rust
+let event = json!({
+    "id": { "pact:matcher:type": "uuid" },
+    "timestamp": { "pact:matcher:type": "iso8601-datetime" },
+    "contract_id": { "pact:matcher:type": "regex", "regex": "^C[A-Z2-7]{55}$" }
+});
+```
 
 ## Tools and References
 

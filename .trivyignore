@@ -1,0 +1,20 @@
+# Trivy ignore file
+# Known false positives / accepted risks for container image scanning.
+# Format: one CVE ID per line. Lines starting with '#' are comments.
+# Each entry MUST include a comment explaining why it is suppressed.
+# Review this file regularly and remove entries once no longer applicable.
+#
+# Documentation: https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/
+
+# Example entries (uncomment and adjust as needed):
+
+# CVE-2023-00000
+#   False positive: vulnerability reported in a package that is not present
+#   in the final image (removed during multi-stage build). Verified via
+#   `trivy image --scanners vuln <image>` and manual inspection.
+
+# CVE-2023-00001
+#   Accepted risk: low-impact issue in a transitive dependency with no
+#   available fix upstream. Tracked in issue #XXXX; revisit when a patched
+#   version is released.
+</｜｜DSML｜｜ parameter>

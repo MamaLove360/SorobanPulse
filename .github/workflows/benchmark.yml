@@ -8,6 +8,7 @@ on:
 # Minimal default permissions.
 permissions:
   contents: read
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,25 +33,36 @@ jobs:
           - 5432:5432
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0  # Need full history to fetch baseline from main
+
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
-      # Criterion compares each run against a saved "base" baseline and reports
-      # "Performance has regressed."/"Performance has improved." automatically.
-      # Restoring the most recent baseline captured on main gives PRs something
-      # real to compare against; a cold cache just means the first run of the day
-      # reports absolute numbers only (no regression to compare against yet).
-      - name: Restore benchmark baseline
+      - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev
+
+      # For PRs: restore baseline from main branch
+      - name: Restore baseline from main (PR only)
+        if: github.event_name == 'pull_request'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/criterion
-          key: criterion-baseline-${{ github.sha }}
+          key: criterion-baseline-main-${{ github.event.pull_request.base.sha }}
           restore-keys: |
-            criterion-baseline-
+            criterion-baseline-main-
 
-      - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev
+      # For main: restore previous baseline
+      - name: Restore previous baseline (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-main-${{ github.sha }}
+          restore-keys: |
+            criterion-baseline-main-
 
       - name: Run benchmarks
         run: |
@@ -62,27 +74,97 @@ jobs:
             --bench query_planning \
             --bench streaming_response \
             --bench db_queries \
-            2>&1 | tee bench_output.txt
+            -- --output-format bencher | tee bench_output.txt
 
-      - name: Check for regressions
+      - name: Store benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          tool: 'cargo'
+          output-file-path: bench_output.txt
+          fail-on-alert: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: false
+
+      - name: Compare against baseline and detect regressions
+        id: compare
+        if: github.event_name == 'pull_request'
         run: |
-          if grep -q "Performance has regressed\." bench_output.txt; then
-            {
-              echo "## :warning: Performance regression detected"
-              echo '```'
-              grep -B3 "Performance has regressed\." bench_output.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "One or more benchmarks regressed beyond criterion's noise threshold. See the job summary for details."
-            exit 1
+          # Parse criterion output for performance changes
+          if [ ! -d target/criterion ]; then
+            echo "No baseline found, skipping regression check"
+            exit 0
           fi
-          echo "## :white_check_mark: No performance regressions detected" >> "$GITHUB_STEP_SUMMARY"
 
-      # Only persist the baseline from main so PRs always compare against main,
-      # never against another PR's (possibly regressed) results.
+          # Extract performance changes from criterion's change/ directories
+          regression_found=false
+          regression_details=""
+
+          for benchmark_dir in target/criterion/*/; do
+            if [ -d "${benchmark_dir}change" ]; then
+              benchmark_name=$(basename "$benchmark_dir")
+              change_file="${benchmark_dir}change/estimates.json"
+              
+              if [ -f "$change_file" ]; then
+                # Extract mean change percentage from criterion's JSON
+                change_pct=$(jq -r '.mean.point_estimate' "$change_file" 2>/dev/null || echo "0")
+                
+                # Check if regression exceeds 15% threshold
+                if (( $(echo "$change_pct > 0.15" | bc -l) )); then
+                  regression_found=true
+                  pct_display=$(echo "scale=1; $change_pct * 100" | bc)
+                  regression_details="${regression_details}\n- **${benchmark_name}**: +${pct_display}% slower"
+                fi
+              fi
+            fi
+          done
+
+          if [ "$regression_found" = true ]; then
+            {
+              echo "## ⚠️ Performance Regression Detected"
+              echo ""
+              echo "The following benchmarks regressed by more than 15%:"
+              echo -e "$regression_details"
+              echo ""
+              echo "Review the performance impact before merging."
+            } > regression-comment.txt
+            
+            echo "regression_found=true" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "## ✅ No Performance Regressions"
+              echo ""
+              echo "All benchmarks are within acceptable performance thresholds."
+            } > regression-comment.txt
+            
+            echo "regression_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post benchmark comparison comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('regression-comment.txt', 'utf8');
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+      - name: Fail on regression
+        if: github.event_name == 'pull_request' && steps.compare.outputs.regression_found == 'true'
+        run: |
+          echo "::error::Performance regression detected exceeding 15% threshold"
+          exit 1
+
+      # Only persist the baseline from main so PRs always compare against main
       - name: Save benchmark baseline
-        if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/criterion
-          key: criterion-baseline-${{ github.sha }}
+          key: criterion-baseline-main-${{ github.sha }}

@@ -74,7 +74,7 @@ pub fn decode_event_data(abi: &Value, event_data: &Value) -> Option<Value> {
     let def = abi
         .as_array()?
         .iter()
-        .find(|e| e.get("name").and_then(Value::as_str) == Some(event_name))?;
+        .find(|e| e.get("name").and_then(Value::as_str) == Some(event_name.as_str()))?;
     let inputs = def.get("inputs")?.as_array()?;
     let values = decode_values(event_data.get("value")?);
 
@@ -160,27 +160,56 @@ pub async fn decode_existing_events(pool: PgPool, contract_id: String, abi: Valu
     }
 }
 
-fn event_name_from_topic(topic: &Value) -> Option<&str> {
+fn event_name_from_topic(topic: &Value) -> Option<String> {
     let first = topic.as_array()?.first()?;
+    // Live-indexed events keep the RPC's base64 XDR; decode to the name.
+    match crate::scval_format::parse_stored(first) {
+        Some(ScVal::Symbol(s)) => return Some(s.0.to_string()),
+        Some(ScVal::String(s)) => return Some(s.0.to_string()),
+        _ => {}
+    }
     first
         .as_str()
         .or_else(|| first.get("symbol").and_then(Value::as_str))
         .or_else(|| first.get("string").and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 fn decode_values(value: &Value) -> serde_json::Map<String, Value> {
-    if let Some(obj) = value.as_object() {
-        if obj.contains_key("vec") {
-            if let Ok(ScVal::Vec(Some(vec))) = serde_json::from_value::<ScVal>(value.clone()) {
-                return vec
-                    .0
-                    .to_vec()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, val)| (i.to_string(), scval_to_json(val)))
-                    .collect();
-            }
+    // Stored ScVals (base64 XDR or stellar-xdr serde JSON): vecs are keyed
+    // by position, maps by key, and a single value is position 0.
+    match crate::scval_format::parse_stored(value) {
+        Some(ScVal::Vec(Some(vec))) => {
+            return vec
+                .0
+                .to_vec()
+                .into_iter()
+                .enumerate()
+                .map(|(i, val)| (i.to_string(), scval_to_json(val)))
+                .collect();
         }
+        Some(ScVal::Map(Some(map))) => {
+            return map
+                .0
+                .to_vec()
+                .into_iter()
+                .map(|e| {
+                    let key = match scval_to_json(e.key) {
+                        Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (key, scval_to_json(e.val))
+                })
+                .collect();
+        }
+        Some(scalar) => {
+            let mut map = serde_json::Map::new();
+            map.insert("0".to_string(), scval_to_json(scalar));
+            return map;
+        }
+        None => {}
+    }
+    if let Some(obj) = value.as_object() {
         return obj.clone();
     }
 
@@ -234,6 +263,23 @@ mod tests {
         let decoded = decode_event_data(&abi, &event_data).unwrap();
         assert_eq!(decoded["event"], "transfer");
         assert_eq!(decoded["amount"], "1000");
+    }
+
+    #[test]
+    fn decodes_base64_xdr_event_data_as_stored_by_the_indexer() {
+        use stellar_xdr::curr::{Limits, ScMap, ScMapEntry, ScSymbol, WriteXdr};
+        let sym = |s: &str| ScVal::Symbol(ScSymbol::try_from(s).unwrap());
+        let b64 = |v: ScVal| json!(v.to_xdr_base64(Limits::none()).unwrap());
+        let abi = json!([{"name": "transfer", "inputs": [{"name": "amount", "type": "u32"}]}]);
+
+        let single = json!({ "topic": [b64(sym("transfer"))], "value": b64(ScVal::U32(7)) });
+        assert_eq!(decode_event_data(&abi, &single).unwrap()["amount"], 7);
+
+        let map = ScVal::Map(Some(ScMap(
+            vec![ScMapEntry { key: sym("amount"), val: ScVal::U32(9) }].try_into().unwrap(),
+        )));
+        let named = json!({ "topic": [b64(sym("transfer"))], "value": b64(map) });
+        assert_eq!(decode_event_data(&abi, &named).unwrap()["amount"], 9);
     }
 
     #[test]

@@ -37,7 +37,7 @@ impl SseRingBuffer {
     /// Returns that UUID so callers can embed it in the outgoing SSE frame.
     pub fn push(&self, event: SorobanEvent) -> Uuid {
         let id = Uuid::new_v4();
-        let mut buf = self.inner.lock().expect("ring buffer lock poisoned");
+        let mut buf = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if buf.len() >= self.capacity {
             buf.pop_front();
             self.overflow_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -52,7 +52,7 @@ impl SseRingBuffer {
     /// due to buffer overflow, so a full replay is not possible.
     /// Returns `Some(vec![])` when `last_id` is the latest event (nothing missed).
     pub fn events_since(&self, last_id: Uuid) -> Option<Vec<SorobanEvent>> {
-        let buf = self.inner.lock().expect("ring buffer lock poisoned");
+        let buf = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let pos = buf.iter().position(|s| s.id == last_id)?;
         // Clone event references outside the critical section to avoid
         // holding the mutex while copying potentially large event data.
@@ -62,7 +62,7 @@ impl SseRingBuffer {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("ring buffer lock poisoned").len()
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     pub fn is_empty(&self) -> bool {

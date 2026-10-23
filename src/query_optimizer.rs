@@ -75,7 +75,7 @@ impl SlowQueryTracker {
     pub fn top_slow(&self, n: usize) -> Vec<SlowQueryRecord> {
         let store = self.records.read().unwrap_or_else(|e| e.into_inner());
         let mut list: Vec<_> = store.values().cloned().collect();
-        list.sort_by(|a, b| b.avg_duration_ms.partial_cmp(&a.avg_duration_ms).unwrap());
+        list.sort_by(|a, b| b.avg_duration_ms.total_cmp(&a.avg_duration_ms));
         list.truncate(n);
         list
     }

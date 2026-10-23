@@ -117,6 +117,81 @@ UNIQUE INDEX idx_events_tx_hash_contract ON events(tx_hash, contract_id, event_t
 
 Serves dual purpose: enforces the deduplication constraint (see above) and supports fast lookups by `(tx_hash, contract_id, event_type)`.
 
+### Partial indexes for common filter combinations (Issue #1343)
+
+Added in `20261022000000_partial_indexes_event_type_ledger.sql`. All three
+indexes are keyed on `(ledger DESC, id DESC)`, which matches the
+`ORDER BY ledger DESC, id DESC` used by `GET /v1/events`, GraphQL and the
+query builder. The planner can therefore read rows in order from the index
+and stop at `LIMIT`, with no sort step.
+
+#### `idx_events_contract_ledger_id_partial`
+
+```sql
+CREATE INDEX idx_events_contract_ledger_id_partial
+    ON events (ledger DESC, id DESC)
+    WHERE event_type = 'contract';
+```
+
+**Optimises:** `GET /v1/events?event_type=contract` with or without a ledger
+range. It replaces the older `idx_events_contract_type_partial (ledger DESC)`,
+which could not cover the `id DESC` tie-breaker.
+
+#### `idx_events_system_ledger_id_partial`
+
+```sql
+CREATE INDEX idx_events_system_ledger_id_partial
+    ON events (ledger DESC, id DESC)
+    WHERE event_type = 'system';
+```
+
+**Optimises:** `GET /v1/events?event_type=system`. System events are rare, so
+this index is tiny, and the planner prefers it over scanning
+`idx_events_type_ledger`.
+
+#### `idx_events_recent_ledger_id`
+
+```sql
+-- <threshold> = GREATEST(MAX(ledger) - 518400, 0) at build time (~30 days of ledgers)
+CREATE INDEX idx_events_recent_ledger_id
+    ON events (ledger DESC, id DESC)
+    WHERE ledger > <threshold>;
+```
+
+**Optimises:** `GET /v1/events?from_ledger=..&to_ledger=..` for recent ranges.
+That covers most ledger-range traffic, and the
+`db/get_events_ledger_range` benchmark measures it. The index covers only
+the most recent window, so it stays small and hot in cache.
+
+A partial index predicate must be a constant, so the threshold is computed
+when the index is built. Slide the window forward periodically, for example
+nightly with pg_cron or an external scheduler:
+
+```sql
+SELECT refresh_recent_ledger_index();         -- default window: 518 400 ledgers
+SELECT refresh_recent_ledger_index(100000);   -- custom window
+```
+
+The function builds the new index under a temporary name, then swaps it in.
+It returns the new threshold. The current threshold is also stored in the
+index comment (`\di+ idx_events_recent_ledger_id`).
+
+#### Planner caveat: bound parameters
+
+PostgreSQL can only use a partial index when it can prove at plan time that
+the query's `WHERE` clause implies the index predicate. With **custom
+plans**, which PostgreSQL uses for the first five executions of a prepared
+statement and afterwards whenever they are cheaper, the bound values
+(`event_type = $1` → `'contract'`, `ledger >= $1` → `60000000`) are known, so
+the partial index is chosen. A **generic plan** cannot see the values and
+falls back to the full indexes (`idx_events_type_ledger`,
+`idx_events_ledger_desc`). This is still correct, just without the partial
+index speed-up. To force custom plans for the application role:
+
+```sql
+ALTER ROLE soroban_pulse SET plan_cache_mode = force_custom_plan;
+```
+
 ---
 
 ## Migration History
@@ -128,6 +203,7 @@ Serves dual purpose: enforces the deduplication constraint (see above) and suppo
 | `20260325000001_composite_indices.sql` | Add composite indexes `idx_events_contract_ledger` and `idx_events_tx_ledger`; drop now-redundant single-column indexes. |
 | `20260424000000_gin_index_event_data.sql` | Add GIN index on `event_data` for JSON containment queries (no-transaction migration). |
 | `20260425000001_event_data_validation.sql` | Add `check_event_data_structure` CHECK constraint. |
+| `20261022000000_partial_indexes_event_type_ledger.sql` | Issue #1343: add partial indexes `idx_events_contract_ledger_id_partial`, `idx_events_system_ledger_id_partial` and `idx_events_recent_ledger_id`, plus the `refresh_recent_ledger_index()` function; drop the superseded `idx_events_contract_type_partial`. |
 
 | `20260425000001_event_data_validation.sql` | Add `check_event_data_structure` CHECK constraint. |
 

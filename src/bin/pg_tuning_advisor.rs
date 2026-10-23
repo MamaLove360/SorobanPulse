@@ -6,6 +6,9 @@
 //! Usage:
 //!   cargo run --bin pg_tuning_advisor -- --memory-mb 8192 --cpu-count 4 \
 //!       --max-connections 100 --ssd
+// Issue #1246: a panic in production is a silent availability incident.
+// Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use soroban_pulse::db_config_advisor::{recommend_postgres_config, PgTuningInput};
 

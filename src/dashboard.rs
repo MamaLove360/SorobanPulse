@@ -95,8 +95,13 @@ where
         tracing::info!(dashboard_dir = %dir.display(), "serving web dashboard at {MOUNT_PATH}");
     }
 
+    // DASHBOARD_CONNECT_SRC is operator input; fall back to a strict policy
+    // rather than aborting startup if it produces an invalid header value.
     let csp = HeaderValue::from_str(&content_security_policy(&config.dashboard_connect_src))
-        .expect("dashboard CSP is a valid header value");
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Invalid DASHBOARD_CONNECT_SRC; using a strict dashboard CSP");
+            HeaderValue::from_static("default-src 'self'")
+        });
 
     let spa = ServeDir::new(dir)
         .precompressed_gzip()

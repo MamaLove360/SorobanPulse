@@ -4,6 +4,10 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+use soroban_pulse::anomaly_detection::{
+    detect_iqr_anomaly, detect_mad_anomaly, detect_zscore_anomaly, AnomalyConfig,
+    BaselineStatistics,
+};
 use soroban_pulse::config::{HealthState, IndexerState};
 use soroban_pulse::metrics::init_metrics;
 use soroban_pulse::routes::create_router;
@@ -231,4 +235,72 @@ async fn anomalies_endpoint_empty_results(pool: PgPool) {
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(result.is_object() || result.is_array());
     }
+}
+
+/// Build a baseline fixture representing a stable event rate of ~100 events
+/// per window, with a small amount of natural variance.
+fn stable_baseline() -> BaselineStatistics {
+    BaselineStatistics {
+        mean: 100.0,
+        std_dev: 5.0,
+        median: 100.0,
+        q1: 97.0,
+        q3: 103.0,
+        mad: 3.0,
+        sample_count: 50,
+    }
+}
+
+/// Regression test for #571: a clear spike (well beyond the configured
+/// threshold) must be flagged by every detector. Previously a spike could
+/// slip through when the baseline had a non-zero standard deviation.
+#[test]
+fn regression_known_spike_is_detected_by_all_detectors() {
+    let baseline = stable_baseline();
+    let config = AnomalyConfig::default();
+    let spike = 500.0;
+
+    assert!(
+        detect_zscore_anomaly(spike, &baseline, &config).is_some(),
+        "z-score detector missed a 5x spike"
+    );
+    assert!(
+        detect_iqr_anomaly(spike, &baseline, &config).is_some(),
+        "IQR detector missed a 5x spike"
+    );
+    assert!(
+        detect_mad_anomaly(spike, &baseline, &config).is_some(),
+        "MAD detector missed a 5x spike"
+    );
+}
+
+/// Regression test: a value within the normal band must never be flagged,
+/// otherwise the endpoint would produce false-positive pages.
+#[test]
+fn regression_normal_value_is_not_flagged() {
+    let baseline = stable_baseline();
+    let config = AnomalyConfig::default();
+    let normal = 101.0;
+
+    assert!(detect_zscore_anomaly(normal, &baseline, &config).is_none());
+    assert!(detect_iqr_anomaly(normal, &baseline, &config).is_none());
+    assert!(detect_mad_anomaly(normal, &baseline, &config).is_none());
+}
+
+/// Regression test: a sharp drop in event rate should be detected as an
+/// anomaly (silent failure case).
+#[test]
+fn regression_known_drop_is_detected() {
+    let baseline = stable_baseline();
+    let config = AnomalyConfig::default();
+    let drop = 0.0;
+
+    assert!(
+        detect_zscore_anomaly(drop, &baseline, &config).is_some(),
+        "z-score detector missed a drop to zero"
+    );
+    assert!(
+        detect_mad_anomaly(drop, &baseline, &config).is_some(),
+        "MAD detector missed a drop to zero"
+    );
 }

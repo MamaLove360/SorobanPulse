@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::metrics;
@@ -705,10 +705,16 @@ pub async fn run_push_delivery_worker(pool: sqlx::PgPool) {
         return;
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .expect("Failed to build push HTTP client");
+    let client = match crate::net::outbound::build_http_client(
+        Client::builder().timeout(Duration::from_secs(15)),
+        "push",
+    ) {
+        Ok(client) => client,
+        Err(e) => {
+            error!(error = %e, "Push worker disabled");
+            return;
+        }
+    };
 
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -757,12 +763,13 @@ pub async fn run_push_delivery_worker(pool: sqlx::PgPool) {
                 DeviceType::Ios => {
                     if let Some(ref apns_cfg) = config.apns {
                         // Refresh JWT if older than 55 min (APNs tokens expire after 60 min).
-                        let jwt = if apns_jwt
+                        let cached = apns_jwt
                             .as_ref()
-                            .map(|(_, t)| t.elapsed().as_secs() > 3300)
-                            .unwrap_or(true)
-                        {
-                            match build_apns_jwt(apns_cfg) {
+                            .filter(|(_, issued)| issued.elapsed().as_secs() <= 3300)
+                            .map(|(jwt, _)| jwt.clone());
+                        let jwt = match cached {
+                            Some(jwt) => jwt,
+                            None => match build_apns_jwt(apns_cfg) {
                                 Ok(j) => {
                                     apns_jwt = Some((j.clone(), std::time::Instant::now()));
                                     j
@@ -771,9 +778,7 @@ pub async fn run_push_delivery_worker(pool: sqlx::PgPool) {
                                     warn!(error = %e, "Failed to build APNs JWT");
                                     continue;
                                 }
-                            }
-                        } else {
-                            apns_jwt.as_ref().unwrap().0.clone()
+                            },
                         };
                         apns_send(&client, apns_cfg, &token, title, &body_text, &jwt).await
                     } else {
@@ -991,7 +996,9 @@ pub async fn get_notification_preferences(
     .await?;
 
     let (prefs_json,) = row.ok_or(AppError::NotFound)?;
-    let prefs = prefs_json.unwrap_or_else(|| serde_json::to_value(NotificationPreferences::default()).unwrap());
+    let prefs = prefs_json.unwrap_or_else(|| {
+        serde_json::to_value(NotificationPreferences::default()).unwrap_or_default()
+    });
 
     Ok(Json(json!({
         "subscription_id": id,

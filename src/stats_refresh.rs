@@ -29,7 +29,7 @@ pub async fn refresh_all(pool: &PgPool) {
     refresh_table_stats(pool).await;
 }
 
-async fn refresh_one(pool: &PgPool, view: &str) {
+pub(crate) async fn refresh_one(pool: &PgPool, view: &str) {
     let start = Instant::now();
 
     // Acquire a dedicated connection so the lock_timeout SET is scoped to this
@@ -237,7 +237,7 @@ pub async fn analyze_query_plans(pool: &PgPool) {
 
 /// Spawn a background task that refreshes the materialized views every `interval_secs` seconds.
 /// Also runs staleness checks and query-plan analysis on each cycle.
-pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<bool>) {
+pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs);
         // Initial refresh on startup
@@ -259,7 +259,7 @@ pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<boo
                 }
             }
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------

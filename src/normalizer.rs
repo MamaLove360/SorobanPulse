@@ -48,7 +48,14 @@ pub fn apply_transform(
                 .as_i64()
                 .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
                 .ok_or_else(|| format!("divide_by_decimals: expected integer, got {value}"))?;
-            let divisor = 10_i64.pow(decimals as u32);
+            // 10^19 already overflows i64, so reject exponents that cannot be
+            // represented instead of panicking (or silently truncating `decimals`).
+            let divisor = u32::try_from(decimals)
+                .ok()
+                .and_then(|d| 10_i64.checked_pow(d))
+                .ok_or_else(|| {
+                    format!("divide_by_decimals: decimals {decimals} is too large (max 18)")
+                })?;
             // Return as a JSON number (f64) — sufficient for display purposes
             Ok(Value::from(raw as f64 / divisor as f64))
         }
@@ -394,6 +401,23 @@ mod tests {
     fn divide_by_decimals_missing_params() {
         let t = Transform::DivideByDecimals;
         assert!(apply_transform(&t, &json!({}), &json!(100)).is_err());
+    }
+
+    #[test]
+    fn divide_by_decimals_max_supported_decimals() {
+        let t = Transform::DivideByDecimals;
+        let result = apply_transform(&t, &json!({"decimals": 18}), &json!(0)).unwrap();
+        assert_eq!(result, json!(0.0));
+    }
+
+    /// Regression for the fuzz_normalizer crash (#1228): `10_i64.pow(38)`
+    /// overflowed and panicked for any integer input.
+    #[test]
+    fn divide_by_decimals_overflowing_decimals_returns_err() {
+        let t = Transform::DivideByDecimals;
+        for decimals in [19_u64, 38, u64::from(u32::MAX) + 1, u64::MAX] {
+            assert!(apply_transform(&t, &json!({"decimals": decimals}), &json!(0)).is_err());
+        }
     }
 
     // --- hex_to_decimal ---

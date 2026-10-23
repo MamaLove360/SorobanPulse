@@ -1,0 +1,27 @@
+{
+  "name": "soroban-pulse-token-alert-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Posts large SEP-41 token transfers indexed by SorobanPulse to a Discord channel.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "postinstall": "npm --prefix ../../sdk/typescript install --no-audit --no-fund && npm --prefix ../../sdk/typescript run build",
+    "start": "tsx --env-file=.env src/index.ts",
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@soroban-pulse/sdk": "file:../../sdk/typescript",
+    "@stellar/stellar-sdk": "13.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.6",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3"
+  },
+  "engines": {
+    "node": ">=20.6"
+  }
+}

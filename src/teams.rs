@@ -41,16 +41,16 @@ pub struct TeamsClient {
 }
 
 impl TeamsClient {
-    pub fn new(config: TeamsConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build Teams HTTP client");
+    pub fn new(config: TeamsConfig) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            Client::builder().timeout(Duration::from_secs(10)),
+            "teams",
+        )?;
 
-        Self {
+        Ok(Self {
             client,
             webhook_url: config.webhook_url,
-        }
+        })
     }
 
     /// Builds the Adaptive Card body for an event, with optional @-mentions
@@ -229,17 +229,6 @@ impl TeamsClient {
     }
 }
 
-/// Deliver an event to Teams with retry logic.
-pub async fn deliver_teams(client: &TeamsClient, event: Event) {
-    if let Err(e) = client.send_with_retry(&event, &[], &[], 3).await {
-        error!(
-            error = %e,
-            contract_id = %event.contract_id,
-            event_type = %event.event_type,
-            "Failed to deliver Teams notification"
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -274,7 +263,7 @@ mod tests {
         let config = TeamsConfig {
             webhook_url: "https://outlook.office.com/webhook/test".to_string(),
         };
-        let client = TeamsClient::new(config);
+        let client = TeamsClient::new(config).unwrap();
         assert_eq!(client.webhook_url, "https://outlook.office.com/webhook/test");
     }
 

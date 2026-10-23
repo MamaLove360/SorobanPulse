@@ -13,15 +13,12 @@
 extern crate metrics as m;
 
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::Mac;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::fmt;
 use std::sync::Mutex;
 use subtle::ConstantTimeEq;
 
-/// HMAC-SHA256 type alias used throughout this module.
-type HmacSha256 = Hmac<Sha256>;
 
 /// Maximum allowed age (in seconds) for a signed request before it is
 /// considered stale and rejected. Set to 5 minutes.
@@ -53,8 +50,7 @@ impl RequestSignature {
     #[must_use]
     pub fn sign(secret: &str, method: &str, path: &str, timestamp: &str, body: &str) -> String {
         let payload = Self::canonical_payload(method, path, timestamp, body);
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .expect("HMAC accepts keys of any length");
+        let mut mac = crate::hmac_util::hmac_sha256(secret.as_bytes());
         mac.update(payload.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
@@ -543,7 +539,7 @@ impl AccessLogger {
             decision,
             recorded_at: Utc::now(),
         };
-        let mut entries = self.entries.lock().expect("access log lock poisoned");
+        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if entries.len() >= self.capacity {
             entries.remove(0);
         }
@@ -553,7 +549,7 @@ impl AccessLogger {
     /// Return the most recent `limit` entries, ordered newest-first.
     #[must_use]
     pub fn recent_entries(&self, limit: usize) -> Vec<AccessLogEntry> {
-        let entries = self.entries.lock().expect("access log lock poisoned");
+        let entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         entries
             .iter()
             .rev()
@@ -566,7 +562,7 @@ impl AccessLogger {
     /// key hash, ordered newest-first.
     #[must_use]
     pub fn entries_for_key(&self, key_hash: &str, limit: usize) -> Vec<AccessLogEntry> {
-        let entries = self.entries.lock().expect("access log lock poisoned");
+        let entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         entries
             .iter()
             .rev()
@@ -579,7 +575,7 @@ impl AccessLogger {
     /// Return the total number of entries currently stored.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.lock().expect("access log lock poisoned").len()
+        self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// Return `true` if the log contains no entries.

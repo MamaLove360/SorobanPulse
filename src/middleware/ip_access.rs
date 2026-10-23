@@ -51,7 +51,7 @@ pub async fn ip_access_control_middleware(
         let mut response = StatusCode::FORBIDDEN.into_response();
         let _ = response
             .headers_mut()
-            .insert("X-Access-Denied-Reason", "ip-policy".parse().unwrap());
+            .insert("X-Access-Denied-Reason", axum::http::HeaderValue::from_static("ip-policy"));
         tracing::warn!(reason = %reason, "Request blocked by IP access control policy");
         return response;
     }

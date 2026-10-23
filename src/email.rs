@@ -413,6 +413,9 @@ impl EmailNotifier {
                             continue;
                         }
                         self.send_batch_email(&events_buffer).await;
+                        // Attribute the delivery cost of this batch to the
+                        // email component so it shows up in the cost report (#1264).
+                        self.record_email_cost(self.to.len()).await;
                         events_buffer.clear();
                         last_sent = now;
                     }
@@ -429,6 +432,7 @@ impl EmailNotifier {
                                 let priority = self.evaluate_priority(&event);
                                 if priority == "critical" {
                                     self.send_batch_email(&[event]).await;
+                                    self.record_email_cost(self.to.len()).await;
                                 } else {
                                     events_buffer.push(event);
                                 }
@@ -443,6 +447,7 @@ impl EmailNotifier {
                                 // Channel closed, flush any remaining events and exit.
                                 if !events_buffer.is_empty() {
                                     self.send_batch_email(&events_buffer).await;
+                                    self.record_email_cost(self.to.len()).await;
                                 }
                                 break;
                             }
@@ -648,6 +653,30 @@ impl EmailNotifier {
         match result {
             Ok(_) => Ok(()),
             Err(e) => Err(Box::new(e)),
+        }
+    }
+
+    /// Record the operational cost of delivering a batch of emails (#1264).
+    ///
+    /// Email delivery is billed per message, so the cost is the number of
+    /// recipients times the configured per-email unit cost. Failures to record
+    /// cost are logged but never block delivery.
+    async fn record_email_cost(&self, recipient_count: usize) {
+        if recipient_count == 0 {
+            return;
+        }
+        let calculator = crate::costs::calculator::CostCalculator::global();
+        let unit_cost = calculator.unit_cost(crate::costs::calculator::CostComponent::Email);
+        let total = unit_cost * recipient_count as f64;
+        if let Err(e) = calculator
+            .record(
+                crate::costs::calculator::CostComponent::Email,
+                total,
+                recipient_count as u64,
+            )
+            .await
+        {
+            warn!(error = %e, "Failed to record email delivery cost");
         }
     }
 }

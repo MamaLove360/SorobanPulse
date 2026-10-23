@@ -81,11 +81,18 @@ tokio-tungstenite = "0.21"
 bytes = "1.5"
 base64 = "0.21"
 hex = "0.4"
+stellar-xdr = { version = "22", features = ["curr", "serde", "base64"] }
 regex = "1"
 blake3 = "1"
 toml = "0.8"
 secrecy = "0.5"
 rand = "0.8"
+
+# Stellar XDR (ScVal rendering, ledger meta / contract spec decoding) and
+# zstd for Galexie ledger files (issues #1252-#1254). 26.x is the newest
+# line that still ships the `curr` module the codebase imports.
+stellar-xdr = { version = "26.0.1", default-features = false, features = ["std", "curr", "base64", "serde"] }
+zstd = "0.13"
 
 # HTTP middleware / static files (the `fs` feature is enabled by `dashboard`)
 tower-http = { version = "0.5", features = ["trace", "cors", "compression-full", "metrics", "request-id", "limit"] }
@@ -107,6 +114,13 @@ mockall = "0.12"
 wiremock = "0.6"
 insta = "1"
 
+[[bin]]
+name = "gen_env_docs"
+path = "src/bin/gen_env_docs.rs"
+
+[[bin]]
+name = "gen_postman"
+path = "src/bin/gen_postman.rs"
 [features]
 default = ["classical-crypto", "dashboard"]
 
@@ -136,6 +150,9 @@ full-observability = ["tracing-opentelemetry", "opentelemetry-jaeger"]
 kafka = ["dep:rdkafka"]
 sqs = []
 pubsub = ["dep:google-cloud-pubsub", "dep:google-cloud-googleapis"]
+
+# Chaos testing (gates tests/chaos_tests.rs advisory-lock failover tests)
+chaos = []
 
 [lints.clippy]
 # Lint policy — replaces the crate-level #![deny]/#![allow] that used to live

@@ -5,7 +5,8 @@ dir = "target/nextest"
 
 [profile.ci]
 fail-fast = false
-failure-output = "immediate-final"
+failure-output = "immediate"
+test-threads = "num-cpus"
 
 [profile.ci.junit]
 path = "junit.xml"

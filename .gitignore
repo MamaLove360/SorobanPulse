@@ -36,6 +36,9 @@ backups/
 **/test-snapshots/
 **/test_snapshots/
 
+# mdBook generated output — never commit the built site
+book/
+
 # Proptest regression files
 proptest-regressions/
 **/proptest-regressions/
@@ -72,6 +75,12 @@ fix_sort2.py
 fix_openapi.py
 fix_openapi2.py
 add_openapi_info.py
+
+# Tutorial example scripts (live in docs/ as code blocks, not as committed files)
+alert_bot.py
+
+# ngrok binary (downloaded locally for tutorials)
+ngrok
 
 # Implementation summary / session artefacts
 IMPLEMENTATION_SUMMARY.md
@@ -136,3 +145,12 @@ tests/parallel_output/
 
 # jsonschema generated artefacts
 *.jsonschema.out
+
+# Docs site (Docusaurus) build output
+docs/site/node_modules/
+docs/site/build/
+docs/site/.docusaurus/
+docs/site/static/openapi.json
+
+# AI tool runtime / session state (specs are committed; agents/ is ephemeral)
+.kiro/agents/

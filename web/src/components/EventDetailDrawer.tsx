@@ -329,12 +329,17 @@ export function EventDetailDrawer({
               mono
               copyLabel="event ID"
             />
-            <FieldRow
-              label="Contract ID"
-              value={event.contract_id}
-              mono
-              copyLabel="contract ID"
-            />
+            <div className="drawer-field">
+              <span className="drawer-field__label">Contract ID</span>
+              <button
+                className="drawer-field__value mono"
+                onClick={() => navigate(`/contracts/${event.contract_id}`)}
+                style={{ cursor: "pointer", textDecoration: "underline" }}
+              >
+                {event.contract_id}
+              </button>
+              <CopyButton value={event.contract_id} label="contract ID" />
+            </div>
             <FieldRow
               label="Tx Hash"
               value={event.tx_hash}

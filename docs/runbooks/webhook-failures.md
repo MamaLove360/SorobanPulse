@@ -76,11 +76,64 @@ curl -v https://subscriber-endpoint.example.com/health
 - Implement exponential backoff for retries
 - Contact the subscriber to increase rate limits
 
+## Dead-Letter Queue (DLQ) Procedures
+
+When a webhook exhausts all retry attempts, it is no longer discarded silently. The failed delivery is moved into the `webhook_dlq` table, which stores the `subscription_id`, `event_id`, `payload`, `last_error`, `failed_at`, and `replayed_at` for each entry. Failed webhooks appear in the DLQ within one retry cycle.
+
+### 1. Monitor DLQ depth
+```bash
+promtool query instant 'soroban_pulse_webhook_dlq_depth'
+```
+A steadily growing `soroban_pulse_webhook_dlq_depth` gauge indicates deliveries are failing and not being recovered. Alert when the gauge exceeds a threshold or grows consistently over time.
+
+### 2. Inspect DLQ entries
+```bash
+# Paginated listing of DLQ entries
+curl -s "$ADMIN_API_URL/v1/admin/webhook-dlq?page=1&page_size=50" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+Review `last_error` and `failed_at` to identify the root cause (see Investigation Steps above). Filter by subscription if needed:
+```bash
+curl -s "$ADMIN_API_URL/v1/admin/webhook-dlq?subscription_id=<subscription-id>" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+### 3. Replay a single entry
+Once the subscriber endpoint is healthy, replay an individual delivery. Replayed webhooks re-enter the normal delivery queue.
+```bash
+curl -s -X POST "$ADMIN_API_URL/v1/admin/webhook-dlq/<dlq-id>/replay" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+### 4. Bulk replay
+Replay all pending DLQ entries, optionally scoped to a single subscription:
+```bash
+# Replay everything
+curl -s -X POST "$ADMIN_API_URL/v1/admin/webhook-dlq/replay" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+
+# Replay only entries for one subscription
+curl -s -X POST "$ADMIN_API_URL/v1/admin/webhook-dlq/replay" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"subscription_id": "<subscription-id>"}' | jq .
+```
+After replay, confirm entries have a non-null `replayed_at` and that `soroban_pulse_webhook_dlq_depth` decreases.
+
+### 5. Delete DLQ entries
+If a delivery is unrecoverable (e.g. the subscription was deleted or the payload is obsolete), remove it from the DLQ:
+```bash
+curl -s -X DELETE "$ADMIN_API_URL/v1/admin/webhook-dlq/<dlq-id>" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
 ## Prevention
 - Monitor webhook failure rate continuously
+- Monitor `soroban_pulse_webhook_dlq_depth` and alert on sustained growth
 - Set up alerts for webhook delivery failures
 - Implement webhook retry logic with exponential backoff
 - Test webhook endpoints regularly
 - Implement webhook signature verification for security
 - Document webhook payload format and size limits
 - Provide webhook testing tools for subscribers
+- Periodically review and replay or prune DLQ entries

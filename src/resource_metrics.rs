@@ -108,7 +108,7 @@ pub fn update_memory_usage() {
 }
 
 /// Spawn a background task that updates resource metrics every 30 seconds.
-pub fn spawn_resource_collector(mut shutdown_rx: watch::Receiver<bool>) {
+pub fn spawn_resource_collector(mut shutdown_rx: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -126,7 +126,7 @@ pub fn spawn_resource_collector(mut shutdown_rx: watch::Receiver<bool>) {
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

@@ -66,7 +66,11 @@ fn rate_limit_json_response(original: Response<Body>) -> Response<Body> {
             builder = builder.header(name, value);
         }
     }
-    builder.body(Body::from(json_bytes)).unwrap()
+    builder
+        .body(Body::from(json_bytes))
+        .unwrap_or_else(|_| {
+            axum::response::IntoResponse::into_response(axum::http::StatusCode::TOO_MANY_REQUESTS)
+        })
 }
 
 /// Middleware that logs slow requests exceeding a configurable threshold.

@@ -170,6 +170,14 @@ pub struct Event {
     /// suffix (Issue #1065).
     #[sqlx(default)]
     pub event_index: Option<i32>,
+    /// Underlying asset code when the event was emitted by a Stellar Asset
+    /// Contract (`"native"` for XLM); `null` otherwise (Issue #1254).
+    #[sqlx(default)]
+    pub asset_code: Option<String>,
+    /// Issuer (`G...`) of the SAC's underlying asset; `null` for native XLM
+    /// and non-SAC events (Issue #1254).
+    #[sqlx(default)]
+    pub asset_issuer: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     pub total_count: i64,
@@ -289,7 +297,8 @@ pub struct SearchParams {
 impl SearchParams {
     pub fn offset(&self) -> i64 {
         let page = self.page.unwrap_or(1).max(1);
-        (page - 1) * self.limit()
+        // Saturate so huge `page` values cannot overflow (Issue #1225).
+        (page - 1).saturating_mul(self.limit())
     }
 
     pub fn limit(&self) -> i64 {
@@ -627,6 +636,18 @@ pub struct ContractSummary {
     pub first_seen_ledger: i64,
     pub last_seen_ledger: i64,
     pub last_event_at: DateTime<Utc>,
+    /// Deployer address from the contract's creation event (Issue #1255);
+    /// `null` until a deployment event has been indexed.
+    #[sqlx(default)]
+    pub deployer: Option<String>,
+    /// Current WASM hash (hex) from deployment/upgrade events (Issue #1255).
+    #[sqlx(default)]
+    pub wasm_hash: Option<String>,
+    #[sqlx(default)]
+    pub deployed_at: Option<DateTime<Utc>>,
+    /// Name from the contract labels registry, if registered (Issue #1255).
+    #[sqlx(default)]
+    pub label: Option<String>,
 }
 
 /// Detailed per-contract summary returned by GET /v1/contracts/:contract_id/summary.
@@ -716,6 +737,9 @@ impl PaginationParams {
         "created_at",
         "schema_version",
         "anonymized",
+        // Issue #1254: SAC underlying asset (null for non-SAC events).
+        "asset_code",
+        "asset_issuer",
     ];
     pub const MAX_CONTRACT_IDS_FILTER: usize = 20;
 
@@ -750,7 +774,8 @@ impl PaginationParams {
     pub fn offset(&self) -> i64 {
         let page = self.page.unwrap_or(1).max(1);
         let limit = self.limit();
-        (page - 1) * limit
+        // Saturate so huge `page` values cannot overflow (Issue #1225).
+        (page - 1).saturating_mul(limit)
     }
 
     pub fn limit(&self) -> i64 {
@@ -765,13 +790,10 @@ impl PaginationParams {
 
         // All three must be provided together or none at all
         if has_lat || has_lon || has_radius {
-            if !has_lat || !has_lon || !has_radius {
+            let (Some(lat), Some(lon), Some(radius)) = (self.near_lat, self.near_lon, self.radius_km)
+            else {
                 return Err("near_lat, near_lon, and radius_km must all be provided together".to_string());
-            }
-
-            let lat = self.near_lat.unwrap();
-            let lon = self.near_lon.unwrap();
-            let radius = self.radius_km.unwrap();
+            };
 
             // Validate latitude range
             if lat < -90.0 || lat > 90.0 {
@@ -903,6 +925,41 @@ fn default_true() -> bool {
     true
 }
 
+/// Lift a live RPC event into the persisted [`Event`] model so notification
+/// channels that format `Event`s (Slack, Discord, Telegram, Teams) can be
+/// driven from the event broadcast pipeline (issue #1245). Fields that only
+/// exist after persistence take neutral defaults.
+impl From<&SorobanEvent> for Event {
+    fn from(e: &SorobanEvent) -> Self {
+        let timestamp = DateTime::parse_from_rfc3339(&e.ledger_closed_at)
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        Self {
+            id: e.id.unwrap_or_else(Uuid::nil),
+            contract_id: e.contract_id.clone(),
+            event_type: e.event_type.parse().unwrap_or(EventType::Contract),
+            tx_hash: e.tx_hash.clone(),
+            ledger: i64::try_from(e.ledger).unwrap_or(i64::MAX),
+            timestamp,
+            event_data: e.value.clone(),
+            event_data_normalized: None,
+            event_data_decoded: None,
+            ledger_hash: e.ledger_hash.clone(),
+            in_successful_call: e.in_successful_call,
+            created_at: timestamp,
+            schema_version: 0,
+            anonymized: false,
+            fingerprint: None,
+            tenant_id: e.tenant_id.clone().unwrap_or_else(|| "default".to_string()),
+            network: "soroban-mainnet".to_string(),
+            tx_index: None,
+            op_index: None,
+            event_index: None,
+            total_count: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +1019,17 @@ mod tests {
     #[test]
     fn page_3_limit_10_offset_is_20() {
         assert_eq!(params(Some(3), Some(10)).offset(), 20);
+    }
+
+    // Regression test for fuzz crash in fuzz_pagination_params (Issue #1225).
+    #[test]
+    fn huge_page_offset_saturates_instead_of_overflowing() {
+        let p: PaginationParams =
+            serde_json::from_str(r#"{"page":9223372036854775807,"limit":100}"#).unwrap();
+        assert_eq!(p.offset(), i64::MAX);
+        let s: SearchParams =
+            serde_json::from_str(r#"{"page":9223372036854775807,"limit":100}"#).unwrap();
+        assert_eq!(s.offset(), i64::MAX);
     }
 
     // --- RPC deserialization fixture tests ---

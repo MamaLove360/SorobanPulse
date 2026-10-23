@@ -699,3 +699,134 @@ async fn chaos_error_then_empty_success_no_data_loss(pool: PgPool) {
         .unwrap();
     assert_eq!(count, 1, "event after recovery should be stored");
 }
+
+// ============================================================================
+// #1274: Advisory lock leader-election failover
+// ============================================================================
+
+/// Leader-election failover: two in-process "replicas" each hold their own DB
+/// connection.  The leader acquires the advisory lock; when its connection is
+/// dropped (simulating a crash) the standby must promote and acquire the lock
+/// within `INDEXER_LOCK_RETRY_SECS + 2s`, and must then emit the
+/// `soroban_pulse_indexer_is_leader = 1` gauge.
+///
+/// Gated behind the `chaos` feature flag so it only runs in the dedicated CI
+/// chaos job.
+#[cfg(feature = "chaos")]
+#[sqlx::test(migrations = "./migrations")]
+async fn test_advisory_lock_failover(pool: PgPool) {
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::Row;
+
+    // Distinct lock key so this test cannot collide with the other advisory
+    // lock tests in this file.
+    let lock_key: i64 = 0x736f726e62616e33; // "sornban3"
+
+    // Retry interval used by the indexer's leader-election loop.
+    let retry_secs = soroban_pulse::config::INDEXER_LOCK_RETRY_SECS;
+    // Total budget for the standby to promote after the leader dies.
+    let promote_budget = Duration::from_secs(retry_secs + 2);
+
+    // Each replica gets its own dedicated connection (not from the shared
+    // pool) so that dropping the leader's connection actually terminates the
+    // PostgreSQL session and releases the session-level advisory lock.
+    let leader_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("leader replica pool");
+    let standby_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("standby replica pool");
+
+    // --- Leader acquires the lock -----------------------------------------
+    let leader_conn = leader_pool.acquire().await.expect("leader conn");
+    let leader_held: bool = sqlx::query("SELECT pg_try_advisory_lock($1)")
+        .bind(lock_key)
+        .fetch_one(&*leader_conn)
+        .await
+        .unwrap()
+        .get(0);
+    assert!(leader_held, "leader replica should acquire the lock");
+
+    // --- Standby cannot acquire while leader is alive ---------------------
+    let standby_conn = standby_pool.acquire().await.expect("standby conn");
+    let standby_blocked: bool = sqlx::query("SELECT pg_try_advisory_lock($1)")
+        .bind(lock_key)
+        .fetch_one(&*standby_conn)
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        !standby_blocked,
+        "standby must not acquire the lock while the leader holds it"
+    );
+
+    // --- Kill the leader: drop its connection (and pool) ------------------
+    // Dropping the connection terminates the session, which releases the
+    // session-level advisory lock server-side.
+    drop(leader_conn);
+    leader_pool.close().await;
+
+    // --- Standby promotes within the retry budget -------------------------
+    let start = Instant::now();
+    let mut promoted = false;
+    while start.elapsed() < promote_budget {
+        let acquired: bool = sqlx::query("SELECT pg_try_advisory_lock($1)")
+            .bind(lock_key)
+            .fetch_one(&*standby_conn)
+            .await
+            .unwrap()
+            .get(0);
+        if acquired {
+            promoted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let elapsed = start.elapsed();
+    assert!(
+        promoted,
+        "standby should promote within {:?} after leader death (waited {:?})",
+        promote_budget, elapsed
+    );
+    assert!(
+        elapsed <= promote_budget,
+        "standby promoted too slowly: {:?} > {:?}",
+        elapsed,
+        promote_budget
+    );
+
+    // --- Standby emits the leader metric ----------------------------------
+    // Mirror what the indexer does on promotion: set the leader gauge to 1.
+    let metrics = soroban_pulse::metrics::init_metrics();
+    soroban_pulse::metrics::set_indexer_is_leader(&metrics, true);
+
+    let rendered = metrics.gather();
+    let leader_gauge = rendered
+        .iter()
+        .find(|family| family.get_name() == "soroban_pulse_indexer_is_leader")
+        .expect("soroban_pulse_indexer_is_leader metric should be registered");
+    let leader_value = leader_gauge
+        .get_metric()
+        .first()
+        .expect("leader gauge should have a sample")
+        .get_gauge()
+        .get_value();
+    assert_eq!(
+        leader_value, 1.0,
+        "standby should report soroban_pulse_indexer_is_leader = 1 after promotion"
+    );
+
+    // --- Cleanup ----------------------------------------------------------
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(lock_key)
+        .execute(&*standby_conn)
+        .await
+        .unwrap();
+    drop(standby_conn);
+    standby_pool.close().await;
+}

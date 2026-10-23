@@ -7,12 +7,10 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
+use hmac::Mac;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-type HmacSha256 = Hmac<Sha256>;
 
 pub const SIGNATURE_HEADER: &str = "X-Signature-256";
 pub const SIGNATURE_KEY_ID_HEADER: &str = "X-Signature-Key-Id";
@@ -100,7 +98,7 @@ impl WebhookKeyManager {
 
     /// Add or replace a key by id.
     pub fn add_key(&self, key: SigningKey) {
-        let mut keys = self.keys.write().unwrap();
+        let mut keys = self.keys.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         keys.retain(|k| k.id != key.id);
         keys.push(key);
     }
@@ -110,7 +108,7 @@ impl WebhookKeyManager {
     /// still succeeds for them until `remove_key` is called after the grace
     /// period elapses).
     pub fn rotate(&self, new_key: SigningKey) {
-        let mut keys = self.keys.write().unwrap();
+        let mut keys = self.keys.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         for k in keys.iter_mut() {
             k.active = false;
         }
@@ -119,13 +117,13 @@ impl WebhookKeyManager {
     }
 
     pub fn remove_key(&self, key_id: &str) {
-        self.keys.write().unwrap().retain(|k| k.id != key_id);
+        self.keys.write().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|k| k.id != key_id);
     }
 
     fn active_key(&self) -> Option<SigningKey> {
         self.keys
             .read()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .rev()
             .find(|k| k.active)
@@ -133,7 +131,7 @@ impl WebhookKeyManager {
     }
 
     fn find_key(&self, key_id: &str) -> Option<SigningKey> {
-        self.keys.read().unwrap().iter().find(|k| k.id == key_id).cloned()
+        self.keys.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|k| k.id == key_id).cloned()
     }
 
     /// Sign a payload with the current active key, producing signature +
@@ -193,7 +191,7 @@ impl WebhookKeyManager {
 /// Binding the timestamp into the signed material (rather than sending it
 /// unsigned alongside) prevents tampering with the timestamp to bypass skew checks.
 fn compute_signature(secret: &[u8], timestamp: u64, payload: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac = crate::hmac_util::hmac_sha256(secret);
     mac.update(timestamp.to_string().as_bytes());
     mac.update(b".");
     mac.update(payload);

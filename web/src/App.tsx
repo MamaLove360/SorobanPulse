@@ -1,120 +1,108 @@
-import { lazy, Suspense } from "react";
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
-import { Layout } from "./components/layout/Layout.tsx";
-import { useSettings } from "./context/SettingsContext.tsx";
+import { Routes, Route, Link } from 'react-router-dom'
+import { useState, useEffect } from 'react'
+import EventExplorer from './pages/EventExplorer'
+import LiveStream from './pages/LiveStream'
+import Status from './pages/Status'
+import AdminConsole from './pages/AdminConsole'
+import { useTheme } from './context/ThemeContext'
 
-// Lazy-load pages — keeps the initial bundle small
-const OverviewPage      = lazy(() => import("./pages/OverviewPage.tsx"));
-const EventsPage        = lazy(() => import("./pages/EventsPage.tsx"));
-const LiveStreamPage    = lazy(() => import("./pages/LiveStreamPage.tsx"));
-const ContractsPage     = lazy(() => import("./pages/ContractsPage.tsx"));
-const SubscriptionsPage = lazy(() => import("./pages/SubscriptionsPage.tsx"));
-const StatusPage        = lazy(() => import("./pages/StatusPage.tsx"));
-const SettingsPage      = lazy(() => import("./pages/SettingsPage.tsx"));
-const NotFoundPage      = lazy(() => import("./pages/NotFoundPage.tsx"));
+function App() {
+  const { toggleTheme, theme } = useTheme()
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 768)
 
-function PageLoader() {
+  useEffect(() => {
+    const handleResize = () => {
+      setIsMobile(window.innerWidth < 768)
+    }
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
+
   return (
-    <p className="text-muted" style={{ padding: "2rem" }}>
-      Loading…
-    </p>
-  );
+    <div style={{ fontFamily: 'system-ui, sans-serif', minHeight: '100vh' }}>
+      <nav
+        style={{
+          padding: '1rem',
+          borderBottom: '1px solid var(--border-color)',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
+        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flex: 1 }}>
+          {isMobile ? (
+            <>
+              <button
+                onClick={() => setMenuOpen(!menuOpen)}
+                style={{
+                  padding: '0.25rem 0.5rem',
+                  fontSize: '1.5rem',
+                  minWidth: '44px',
+                  minHeight: '44px',
+                }}
+              >
+                ☰
+              </button>
+              {menuOpen && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: '60px',
+                    left: 0,
+                    right: 0,
+                    backgroundColor: 'var(--bg-color)',
+                    borderBottom: '1px solid var(--border-color)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    padding: '1rem',
+                  }}
+                >
+                  <Link to="/" onClick={() => setMenuOpen(false)}>
+                    Event Explorer
+                  </Link>
+                  <Link to="/live" onClick={() => setMenuOpen(false)}>
+                    Live Stream
+                  </Link>
+                  <Link to="/status" onClick={() => setMenuOpen(false)}>
+                    Status
+                  </Link>
+                  <Link to="/admin" onClick={() => setMenuOpen(false)}>
+                    Admin
+                  </Link>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <Link to="/">Event Explorer</Link>
+              <Link to="/live">Live Stream</Link>
+              <Link to="/status">Status</Link>
+              <Link to="/admin">Admin</Link>
+            </>
+          )}
+        </div>
+        <button
+          onClick={toggleTheme}
+          style={{
+            padding: '0.5rem 0.75rem',
+            minWidth: '44px',
+            minHeight: '44px',
+          }}
+          title="Toggle theme"
+        >
+          {theme === 'light' ? '🌙' : '☀️'}
+        </button>
+      </nav>
+      <Routes>
+        <Route path="/" element={<EventExplorer />} />
+        <Route path="/live" element={<LiveStream />} />
+        <Route path="/status" element={<Status />} />
+        <Route path="/admin" element={<AdminConsole />} />
+      </Routes>
+    </div>
+  )
 }
 
-/**
- * Guards all non-settings routes.
- * When the dashboard has no server URL configured it redirects to /settings
- * so the user is forced through the first-run setup before anything else loads.
- * The `from` path is passed as `?next=` so settings can redirect back after saving.
- */
-function RequireConfig({ children }: { children: React.ReactNode }) {
-  const { isConfigured } = useSettings();
-  const location = useLocation();
-
-  if (!isConfigured) {
-    return (
-      <Navigate
-        to={`/settings?next=${encodeURIComponent(location.pathname + location.search)}`}
-        replace
-      />
-    );
-  }
-
-  return <>{children}</>;
-}
-
-export default function App() {
-  return (
-    <BrowserRouter>
-      <Suspense fallback={<PageLoader />}>
-        <Routes>
-          <Route element={<Layout />}>
-            {/* Settings is always accessible — it's how you get configured */}
-            <Route path="settings" element={<SettingsPage />} />
-
-            {/* All other routes require configuration */}
-            <Route
-              index
-              element={
-                <RequireConfig>
-                  <OverviewPage />
-                </RequireConfig>
-              }
-            />
-            <Route
-              path="events"
-              element={
-                <RequireConfig>
-                  <EventsPage />
-                </RequireConfig>
-              }
-            />
-            <Route
-              path="events/stream"
-              element={
-                <RequireConfig>
-                  <LiveStreamPage />
-                </RequireConfig>
-              }
-            />
-            {/* Deep-link: /events/:id opens the drawer directly */}
-            <Route
-              path="events/:eventId"
-              element={
-                <RequireConfig>
-                  <EventsPage />
-                </RequireConfig>
-              }
-            />
-            <Route
-              path="contracts"
-              element={
-                <RequireConfig>
-                  <ContractsPage />
-                </RequireConfig>
-              }
-            />
-            <Route
-              path="subscriptions"
-              element={
-                <RequireConfig>
-                  <SubscriptionsPage />
-                </RequireConfig>
-              }
-            />
-            <Route
-              path="status"
-              element={
-                <RequireConfig>
-                  <StatusPage />
-                </RequireConfig>
-              }
-            />
-
-            <Route path="*" element={<NotFoundPage />} />
-          </Route>
-        </Routes>
-      </Suspense>
-    </BrowserRouter>
-  );
-}
+export default App

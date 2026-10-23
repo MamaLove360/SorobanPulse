@@ -277,3 +277,38 @@ BEGIN
 END;
 $$;
 
+
+-- Operational Cost Tracking (#1264)
+-- ==================================
+
+-- Hourly cost snapshots persisted by the cost calculator
+CREATE TABLE IF NOT EXISTS cost_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    snapshot_hour TIMESTAMPTZ NOT NULL,
+    component TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    cost NUMERIC NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(snapshot_hour, component, resource_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cost_snapshots_hour
+    ON cost_snapshots(snapshot_hour DESC);
+
+
+-- Idempotency Keys (#1266)
+-- ========================
+
+-- Stores cached responses for POST requests carrying an Idempotency-Key header
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    response_body TEXT,
+    status_code INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_expires_at
+    ON idempotency_keys(expires_at);
+

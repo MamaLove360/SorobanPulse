@@ -2,9 +2,10 @@
   "name": "SorobanPulse Dev",
 
   // ── Compose-based setup ───────────────────────────────────────────────────
-  // Uses a dedicated override file so the dev container gets a fresh build
-  // with dev tools installed, while the production Dockerfile stays lean.
-  "dockerComposeFile": "docker-compose.devcontainer.yml",
+  // The `app` service is built from the mcr.microsoft.com/devcontainers/rust
+  // base image (see docker-compose.yml) with dev tools layered on top, while
+  // PostgreSQL runs as a sibling Compose service.
+  "dockerComposeFile": "docker-compose.yml",
   "service": "app",
   "workspaceFolder": "/workspaces/SorobanPulse",
 
@@ -25,7 +26,7 @@
     }
   },
 
-  // ── Post-create: migrations + optional seed data ──────────────────────────
+  // ── Post-create: env file, build, migrations ──────────────────────────────
   "postCreateCommand": "bash .devcontainer/postCreate.sh",
 
   // ── VS Code extensions ────────────────────────────────────────────────────
@@ -45,6 +46,7 @@
 
         // Database
         "cweijan.vscode-postgresql-client2",
+        "ms-ossdata.vscode-pgsql",
 
         // General DX
         "eamodio.gitlens",

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use colored::Colorize;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 
@@ -74,10 +75,10 @@ impl SseParser {
     }
 }
 
-/// Copy events from an SSE body to `out` as NDJSON. Frames whose data is not
-/// JSON are skipped. Returns the number of events written; a closed pipe on
-/// `out` (e.g. `| head`) ends the stream quietly.
-pub fn pipe_ndjson<R: Read, W: Write>(body: R, out: &mut W) -> Result<u64> {
+/// Copy events from an SSE body to `out` as NDJSON with optional color-coding.
+/// Frames whose data is not JSON are skipped. Returns the number of events written;
+/// a closed pipe on `out` (e.g. `| head`) ends the stream quietly.
+pub fn pipe_ndjson<R: Read, W: Write>(body: R, out: &mut W, use_color: bool) -> Result<u64> {
     let mut reader = BufReader::new(body);
     let mut parser = SseParser::default();
     let mut line = String::new();
@@ -98,7 +99,13 @@ pub fn pipe_ndjson<R: Read, W: Write>(body: R, out: &mut W) -> Result<u64> {
             continue;
         };
 
-        let result = writeln!(out, "{event}").and_then(|_| out.flush());
+        let output = if use_color {
+            colorize_event(&event)
+        } else {
+            event.to_string()
+        };
+
+        let result = writeln!(out, "{output}").and_then(|_| out.flush());
         match result {
             Ok(()) => written += 1,
             Err(e) if e.kind() == ErrorKind::BrokenPipe => return Ok(written),
@@ -107,13 +114,44 @@ pub fn pipe_ndjson<R: Read, W: Write>(body: R, out: &mut W) -> Result<u64> {
     }
 }
 
-pub fn run(client: &ApiClient, contract: &str, event_type: Option<&str>) -> Result<u64> {
+fn colorize_event(event: &Value) -> String {
+    let mut output = event.to_string();
+
+    if let Some(event_type) = event.get("event_type").and_then(|v| v.as_str()) {
+        let colored_type = match event_type {
+            "contract" => event_type.cyan(),
+            "diagnostic" => event_type.yellow(),
+            "system" => event_type.magenta(),
+            _ => event_type.white(),
+        };
+        output = output.replace(
+            &format!("\"event_type\":\"{}\"", event_type),
+            &format!("\"event_type\":\"{}\"", colored_type),
+        );
+    }
+
+    if let Some(status) = event.get("in_successful_call").and_then(|v| v.as_bool()) {
+        let colored_status = if status {
+            "true".green()
+        } else {
+            "false".red()
+        };
+        output = output.replace(
+            &format!("\"in_successful_call\":{}", status),
+            &format!("\"in_successful_call\":{}", colored_status),
+        );
+    }
+
+    output
+}
+
+pub fn run(client: &ApiClient, contract: &str, event_type: Option<&str>, disable_color: bool) -> Result<u64> {
     let mut params = vec![("contract_id", contract)];
     if let Some(t) = event_type {
         params.push(("event_type", t));
     }
     let resp = client.stream("/v1/events/stream", &params)?;
-    pipe_ndjson(resp, &mut std::io::stdout().lock())
+    pipe_ndjson(resp, &mut std::io::stdout().lock(), !disable_color)
 }
 
 #[cfg(test)]
@@ -154,7 +192,7 @@ mod tests {
     fn pipes_json_events_as_ndjson() {
         let body = "id: 1\ndata: not json\n\n: keep-alive\n\ndata: {\"ledger\":6}\n\n";
         let mut out = Vec::new();
-        let n = pipe_ndjson(body.as_bytes(), &mut out).unwrap();
+        let n = pipe_ndjson(body.as_bytes(), &mut out, false).unwrap();
         assert_eq!(n, 1);
         assert_eq!(String::from_utf8(out).unwrap(), "{\"ledger\":6}\n");
     }
@@ -163,7 +201,7 @@ mod tests {
     fn multi_line_data_is_joined_before_parsing() {
         let body = "data: {\"ledger\":\ndata: 7}\n\n";
         let mut out = Vec::new();
-        assert_eq!(pipe_ndjson(body.as_bytes(), &mut out).unwrap(), 1);
+        assert_eq!(pipe_ndjson(body.as_bytes(), &mut out, false).unwrap(), 1);
         assert_eq!(String::from_utf8(out).unwrap(), "{\"ledger\":7}\n");
     }
 
@@ -180,7 +218,7 @@ mod tests {
     #[test]
     fn closed_stdout_ends_quietly() {
         assert_eq!(
-            pipe_ndjson("data: {}\n\n".as_bytes(), &mut ClosedPipe).unwrap(),
+            pipe_ndjson("data: {}\n\n".as_bytes(), &mut ClosedPipe, false).unwrap(),
             0
         );
     }

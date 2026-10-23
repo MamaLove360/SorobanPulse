@@ -1,0 +1,7 @@
+DROP INDEX IF EXISTS idx_events_sep41_ledger;
+DROP INDEX IF EXISTS idx_events_sep41_to;
+DROP INDEX IF EXISTS idx_events_sep41_from;
+ALTER TABLE events DROP COLUMN IF EXISTS sep41_amount;
+ALTER TABLE events DROP COLUMN IF EXISTS sep41_to;
+ALTER TABLE events DROP COLUMN IF EXISTS sep41_from;
+ALTER TABLE events DROP COLUMN IF EXISTS sep41_event_type;

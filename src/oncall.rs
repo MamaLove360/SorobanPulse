@@ -52,20 +52,20 @@ impl OnCallScheduler {
         api_key: Option<String>,
         schedule_id: Option<String>,
         cache_ttl_secs: u64,
-    ) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build on-call HTTP client");
+    ) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            Client::builder().timeout(Duration::from_secs(10)),
+            "on-call",
+        )?;
 
-        Self {
+        Ok(Self {
             client,
             provider,
             api_key,
             schedule_id,
             cache_ttl: Duration::from_secs(cache_ttl_secs),
             cache: Arc::new(RwLock::new(None)),
-        }
+        })
     }
 
     /// Build an OnCallScheduler from the application config.
@@ -307,7 +307,8 @@ mod tests {
             Some("test-api-key".to_string()),
             Some("SCHEDULE123".to_string()),
             300,
-        );
+        )
+        .unwrap();
         assert_eq!(scheduler.provider, "pagerduty");
         assert_eq!(scheduler.cache_ttl, Duration::from_secs(300));
     }

@@ -35,7 +35,7 @@ pub async fn head_middleware(req: Request, next: Next) -> Response {
 
     resp_parts.headers.insert(
         axum::http::header::CONTENT_LENGTH,
-        body_bytes.len().to_string().parse().unwrap(),
+        axum::http::HeaderValue::from(body_bytes.len()),
     );
 
     Response::from_parts(resp_parts, axum::body::Body::empty())
@@ -80,9 +80,7 @@ pub async fn cache_middleware(req: Request, next: Next) -> Response {
 
     parts.headers.insert(
         "Cache-Control",
-        cache_control
-            .parse()
-            .unwrap_or_else(|_| "no-cache".parse().unwrap()),
+        axum::http::HeaderValue::from_static(cache_control),
     );
 
     if let Ok(body_bytes) = axum::body::to_bytes(body, usize::MAX).await {
@@ -94,7 +92,7 @@ pub async fn cache_middleware(req: Request, next: Next) -> Response {
         parts.headers.insert(
             "ETag",
             etag.parse()
-                .unwrap_or_else(|_| "\"unknown\"".parse().unwrap()),
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("\"unknown\"")),
         );
 
         Response::from_parts(parts, axum::body::Body::from(body_bytes))

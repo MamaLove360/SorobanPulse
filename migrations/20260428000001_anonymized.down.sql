@@ -1,1 +1,1 @@
-ALTER TABLE events DROP COLUMN anonymized;
+ALTER TABLE events DROP COLUMN IF EXISTS anonymized;

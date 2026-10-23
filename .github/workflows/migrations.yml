@@ -6,12 +6,16 @@ on:
     paths:
       - "migrations/**"
       - "scripts/migration-roundtrip.sh"
+      - "scripts/check-migrations.sh"
       - ".github/workflows/migrations.yml"
+      - ".github/workflows/ci.yml"
   pull_request:
     paths:
       - "migrations/**"
       - "scripts/migration-roundtrip.sh"
+      - "scripts/check-migrations.sh"
       - ".github/workflows/migrations.yml"
+      - ".github/workflows/ci.yml"
 
 concurrency:
   group: migrations-${{ github.ref }}
@@ -42,4 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: pg_dump --version
-      - run: bash scripts/migration-roundtrip.sh migrations
+      - name: Check migration pairs
+        run: bash scripts/check-migrations.sh
+      - name: Run migration round trip
+        run: bash scripts/migration-roundtrip.sh migrations

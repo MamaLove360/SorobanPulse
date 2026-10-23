@@ -5,6 +5,9 @@
 //!   schema_cli compat <old-schema.json> <new-schema.json> [backward|forward|full]
 //!   schema_cli gen <schema.json>
 //!   schema_cli doc <contract_id> <version> <schema.json>
+// Issue #1246: a panic in production is a silent availability incident.
+// Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use serde_json::Value;
 use soroban_pulse::schema_validator::{

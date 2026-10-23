@@ -10,9 +10,16 @@ address.
 
 Endpoints:
   POST /hook         – Accept a webhook delivery (always returns 200)
-  GET  /received     – Return list of received deliveries as JSON
+  GET  /received     – Return list of received deliveries as JSON, including the
+                       raw body and the X-Signature-256 header so runners can
+                       recompute the HMAC
   POST /reset        – Clear all recorded deliveries
   GET  /health       – Liveness probe (returns {"status":"ok"})
+
+Environment:
+  PORT            – Listen port (default 9002)
+  WEBHOOK_SECRET  – Shared secret used by the signature scenario; exposed via
+                    GET /health so runners can verify HMACs
 """
 
 from __future__ import annotations
@@ -23,6 +30,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 received: list[dict[str, Any]] = []
+
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+=======
 
 
 class SinkHandler(BaseHTTPRequestHandler):
@@ -49,6 +59,8 @@ class SinkHandler(BaseHTTPRequestHandler):
             received.append({
                 "headers": dict(self.headers),
                 "body": payload,
+                "raw_body": raw,
+                "signature": self.headers.get("X-Signature-256", ""),
             })
             print(f"[webhook-sink] received delivery #{len(received)}", flush=True)
             self._send(200, {"status": "ok", "count": len(received)})
@@ -60,7 +72,7 @@ class SinkHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._send(200, {"status": "ok"})
+            self._send(200, {"status": "ok", "secret_configured": bool(WEBHOOK_SECRET)})
         elif self.path == "/received":
             self._send(200, {"deliveries": received, "count": len(received)})
         else:
@@ -70,7 +82,11 @@ class SinkHandler(BaseHTTPRequestHandler):
 def main() -> None:
     port = int(os.environ.get("PORT", "9002"))
     server = HTTPServer(("0.0.0.0", port), SinkHandler)
-    print(f"[webhook-sink] listening on :{port}", flush=True)
+    print(
+        f"[webhook-sink] listening on :{port} "
+        f"(secret {'configured' if WEBHOOK_SECRET else 'not configured'})",
+        flush=True,
+    )
     server.serve_forever()
 
 

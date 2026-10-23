@@ -336,17 +336,16 @@
           "400": {
             "description": "Invalid query parameters",
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProblemDetail"
                 },
                 "example": {
-                  "error": "unknown event_type: bogus"
+                  "type": "https://soroban-pulse.dev/errors/invalid-query-parameter",
+                  "title": "Invalid query parameter",
+                  "status": 400,
+                  "detail": "unknown event_type: bogus",
+                  "instance": "/v1/events"
                 }
               }
             }
@@ -445,10 +444,24 @@
             }
           },
           "400": {
-            "description": "Invalid query parameters or unsupported format"
+            "description": "Invalid query parameters or unsupported format",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           },
           "401": {
-            "description": "API key required"
+            "description": "API key required",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -588,7 +601,14 @@
             }
           },
           "400": {
-            "description": "Invalid contract_id format or ledger range"
+            "description": "Invalid contract_id format or ledger range",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -624,7 +644,14 @@
             }
           },
           "400": {
-            "description": "Invalid contract_id format"
+            "description": "Invalid contract_id format",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -662,7 +689,14 @@
             }
           },
           "400": {
-            "description": "Invalid contract_id format"
+            "description": "Invalid contract_id format",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -709,7 +743,14 @@
             }
           },
           "404": {
-            "description": "ABI not found"
+            "description": "ABI not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       },
@@ -726,6 +767,17 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional client-generated key (max 255 chars) used to make retries safe. Identical requests with the same key within 24 hours return the cached response and do not create a duplicate resource.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 255,
+              "nullable": true
             }
           }
         ],
@@ -773,7 +825,126 @@
             }
           },
           "400": {
-            "description": "Invalid contract_id or ABI"
+            "description": "Invalid contract_id or ABI",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/costs/report": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Operational cost breakdown by component.",
+        "description": "Returns aggregated operational costs (RPC calls, DB queries, notification delivery)\nbroken down by component, together with a linear forecast of future costs.",
+        "operationId": "get_costs_report",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start of the reporting window (ISO 8601). Defaults to 24 hours ago.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            },
+            "example": "2026-08-19T00:00:00Z"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End of the reporting window (ISO 8601). Defaults to now.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            },
+            "example": "2026-08-20T00:00:00Z"
+          },
+          {
+            "name": "forecast_hours",
+            "in": "query",
+            "description": "Number of hours to forecast beyond the window (default 24, max 168).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            },
+            "example": 24
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cost breakdown by component with forecast",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CostReport"
+                },
+                "example": {
+                  "window_start": "2026-08-19T00:00:00Z",
+                  "window_end": "2026-08-20T00:00:00Z",
+                  "total_cost": 12.3456,
+                  "currency": "USD",
+                  "components": [
+                    {
+                      "component": "rpc",
+                      "call_count": 18420,
+                      "total_cost": 7.368,
+                      "unit_cost": 0.0004
+                    },
+                    {
+                      "component": "db",
+                      "call_count": 51230,
+                      "total_cost": 4.0984,
+                      "unit_cost": 0.00008
+                    },
+                    {
+                      "component": "notification",
+                      "call_count": 879,
+                      "total_cost": 0.8792,
+                      "unit_cost": 0.001
+                    }
+                  ],
+                  "forecast": {
+                    "horizon_hours": 24,
+                    "predicted_total_cost": 12.9,
+                    "slope_per_hour": 0.5375,
+                    "intercept": 0.0
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid time window or forecast horizon",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API key required",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -860,7 +1031,14 @@
             }
           },
           "400": {
-            "description": "Invalid contract_id, bucket, or date range"
+            "description": "Invalid contract_id, bucket, or date range",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -929,7 +1107,14 @@
             }
           },
           "400": {
-            "description": "Invalid tx_hash or depth"
+            "description": "Invalid tx_hash or depth",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -985,7 +1170,14 @@
             }
           },
           "400": {
-            "description": "Invalid tx_hash format"
+            "description": "Invalid tx_hash format",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -996,6 +1188,19 @@
           "events"
         ],
         "operationId": "get_events_by_tx_batch",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional client-generated key (max 255 chars) used to make retries safe. Identical requests with the same key within 24 hours return the cached response and do not create a duplicate resource.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 255,
+              "nullable": true
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1045,16 +1250,44 @@
             }
           },
           "400": {
-            "description": "Invalid hashes or too many hashes"
+            "description": "Invalid hashes or too many hashes",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           },
           "401": {
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Too many requests"
+            "description": "Too many requests",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Internal server error"
+            "description": "Internal server error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }
@@ -1243,6 +1476,138 @@
           "hashes": [
             "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"
           ]
+        }
+      },
+      "ProblemDetail": {
+        "type": "object",
+        "description": "RFC 9457 problem details object returned for all error responses.",
+        "required": [
+          "type",
+          "title",
+          "status"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri",
+            "description": "URI reference identifying the problem type."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short, human-readable summary of the problem type."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "HTTP status code generated for this occurrence."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Human-readable explanation specific to this occurrence."
+          },
+          "instance": {
+            "type": "string",
+            "format": "uri",
+            "description": "URI reference identifying the specific occurrence."
+          }
+        },
+        "example": {
+          "type": "https://soroban-pulse.dev/errors/invalid-query-parameter",
+          "title": "Invalid query parameter",
+          "status": 400,
+          "detail": "unknown event_type: bogus",
+          "instance": "/v1/events"
+        }
+      },
+      "CostComponent": {
+        "type": "object",
+        "required": [
+          "component",
+          "call_count",
+          "total_cost",
+          "unit_cost"
+        ],
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Cost component: rpc, db, or notification."
+          },
+          "call_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_cost": {
+            "type": "number",
+            "format": "double"
+          },
+          "unit_cost": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "CostForecast": {
+        "type": "object",
+        "required": [
+          "horizon_hours",
+          "predicted_total_cost",
+          "slope_per_hour",
+          "intercept"
+        ],
+        "properties": {
+          "horizon_hours": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "predicted_total_cost": {
+            "type": "number",
+            "format": "double"
+          },
+          "slope_per_hour": {
+            "type": "number",
+            "format": "double"
+          },
+          "intercept": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "CostReport": {
+        "type": "object",
+        "required": [
+          "window_start",
+          "window_end",
+          "total_cost",
+          "currency",
+          "components",
+          "forecast"
+        ],
+        "properties": {
+          "window_start": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window_end": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "total_cost": {
+            "type": "number",
+            "format": "double"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "components": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CostComponent"
+            }
+          },
+          "forecast": {
+            "$ref": "#/components/schemas/CostForecast"
+          }
         }
       }
     }

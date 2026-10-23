@@ -139,9 +139,7 @@ For Stellar/Soroban terminology used throughout, see the [Glossary](glossary.md)
 | `data_quality.rs` | Validates event payload shapes and flags malformed rows. |
 | `backup_verification.rs` | Verifies that PostgreSQL backup dumps are restorable and complete. |
 | `replica_monitor.rs` | Tracks replication lag on PostgreSQL read replicas. |
-| `connection_pool.rs` | Advanced connection pool management and health monitoring. |
-| `adaptive_pool.rs` | Dynamically adjusts pool size based on observed query latency. |
-| `pool_management.rs` | Pool lifecycle helpers (drain, resize, health check). |
+| `db_pool/` | Unified connection pool: `connect` / `DbPool::init` (single init path), `monitor` (utilization + wait-time metrics), `adaptive` (sizing recommendations, health checks), `management` (admin API helpers). |
 | `conditional_get.rs` | HTTP conditional GET (`ETag` / `Last-Modified`) support for caching. |
 | `http_caching.rs` | HTTP cache control header injection (`Cache-Control`, `Vary`). |
 | `compression_config.rs` | Configures response compression (gzip/zstd) levels and thresholds. |

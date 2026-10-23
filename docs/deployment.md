@@ -1,5 +1,44 @@
 # Deployment Guide
 
+## Installing from the Helm repository
+
+The Helm chart in `helm/soroban-pulse/` is published to GitHub Pages (the
+`gh-pages` branch) by `.github/workflows/helm-release.yml` on each release, so
+you can install it without cloning the repository. Chart versions track the
+application version tag — the chart released alongside `v1.2.3` is version
+`1.2.3`.
+
+```bash
+# Add the repository (replace <org> with the GitHub organisation/user)
+helm repo add soroban-pulse https://<org>.github.io/SorobanPulse
+
+# Refresh the local index
+helm repo update
+
+# Confirm the chart is available
+helm search repo soroban-pulse
+```
+
+Then install the chart:
+
+```bash
+helm install soroban-pulse soroban-pulse/soroban-pulse \
+  --namespace soroban-pulse --create-namespace \
+  --set resources.requests.memory=512Mi \
+  --set resources.limits.memory=1Gi
+```
+
+To upgrade an existing release to the latest published chart version:
+
+```bash
+helm repo update
+helm upgrade soroban-pulse soroban-pulse/soroban-pulse
+```
+
+To pin a specific release, pass `--version <chart-version>` (e.g.
+`--version 1.2.3`). The `resources` overrides shown above work the same way as
+when installing from a local checkout (see [Resource Sizing](#resource-sizing)).
+
 ## Resource Sizing
 
 ### Recommended defaults
@@ -32,6 +71,74 @@ The `PodMemoryNearLimit` alert in `docs/alerts.yml` fires when `soroban_pulse_pr
 1. Checking for a memory leak (`kubectl top pod`, heap profiling).
 2. Increasing the limit and request if usage is legitimately growing with load.
 3. Scaling horizontally (`replicaCount` / HPA) to spread the load.
+
+---
+
+## Building the Docker Image
+
+The `Dockerfile` is a multi-stage build that uses [`cargo-chef`](https://github.com/LukeMathWalker/cargo-chef) to cache dependency compilation and ships a minimal `gcr.io/distroless/cc-debian12` runtime image.
+
+### Stages
+
+| Stage | Base image | Purpose |
+| ----- | ---------- | ------- |
+| `chef` | `rust:1-slim-bookworm` | Installs `cargo-chef` |
+| `planner` | `chef` | Produces the dependency recipe (`recipe.json`) |
+| `builder` | `chef` | Compiles dependencies from the recipe, then the application |
+| `runtime` | `gcr.io/distroless/cc-debian12` | Final image — binary + CA certs only |
+
+Because the dependency layer is keyed on `recipe.json`, changing application source only recompiles the crate itself, not its dependencies.
+
+### Building locally
+
+```bash
+# Standard build
+docker build -t soroban-pulse:latest .
+
+# Build for a specific platform (e.g. Apple Silicon -> amd64 servers)
+docker build --platform linux/amd64 -t soroban-pulse:latest .
+```
+
+The build is also wired into the Makefile:
+
+```bash
+make docker-build
+```
+
+### Expected image size
+
+The final image is **under 80 MB** (typically ~40–60 MB depending on the Rust toolchain version). Verify it with:
+
+```bash
+docker image inspect soroban-pulse:latest --format '{{.Size}}' | awk '{printf "%.1f MB\n", $1/1024/1024}'
+```
+
+### CI size gate
+
+The `docker` job in `.github/workflows/ci.yml` builds the image and **fails the build if the final image exceeds 80 MB**. The check runs after the build:
+
+```bash
+SIZE_BYTES=$(docker image inspect soroban-pulse:ci --format '{{.Size}}')
+MAX_BYTES=$((80 * 1024 * 1024))
+if [ "$SIZE_BYTES" -gt "$MAX_BYTES" ]; then
+  echo "Image is $((SIZE_BYTES / 1024 / 1024)) MB, exceeds 80 MB limit" >&2
+  exit 1
+fi
+```
+
+If this gate fails, check whether a new dependency pulled in large assets, or whether the build accidentally copied extra files into the runtime stage.
+
+### Runtime environment differences
+
+The distroless runtime image is intentionally minimal:
+
+- **No shell** — `docker exec ... sh` will not work. Use `kubectl debug` with an ephemeral container, or a sidecar, for interactive troubleshooting.
+- **No package manager** — install nothing at runtime; everything must be baked into the build stage.
+- **CA certificates** are included, so outbound TLS (Stellar RPC, S3 backups) works out of the box.
+- **Non-root user** — the container runs as `nonroot` (UID 65532). Ensure any mounted secret files are readable by that UID.
+- **Entrypoint** — the binary is the entrypoint (`/soroban-pulse`); pass arguments directly, e.g. `docker run soroban-pulse:latest --help`.
+- **Environment variables** — all env var defaults (`PORT=3000`, `ENVIRONMENT=development`, `BEHIND_PROXY=false`, etc.) are unchanged; nothing is baked into the image.
+- **Healthcheck** — the image declares a `HEALTHCHECK` that polls `GET /healthz/ready` on `$PORT` every 10 seconds (5s timeout, 5 retries, 30s start period). Because there is no shell, the check uses the binary's built-in `healthcheck` subcommand rather than `curl`/`wget`.
 
 ---
 
@@ -322,6 +429,49 @@ For high-volume production deployments, consider a dedicated RPC provider:
 | -------- | ---------- |
 | QuickNode | `https://<endpoint>.stellar.quiknode.pro/<token>/` |
 | Ankr | `https://rpc.ankr.com/stellar_soroban/<token>` |
+
+### Multiple endpoints and automatic failover (`STELLAR_RPC_URLS`)
+
+Configure several RPC endpoints for the same network and the indexer routes
+each request to the fastest healthy one:
+
+```bash
+STELLAR_RPC_URLS=https://rpc-a.example.com,https://rpc-b.example.com/<token>
+```
+
+| Variable | Description |
+| -------- | ----------- |
+| `STELLAR_RPC_URLS` | Comma-separated endpoint list. Takes precedence over `STELLAR_RPC_URL`; the first entry is the primary. |
+| `STELLAR_RPC_URL` | Single endpoint, used when `STELLAR_RPC_URLS` is unset. |
+| `STELLAR_RPC_FALLBACK_URLS` | Extra endpoints appended to either of the above (kept for backward compatibility). |
+
+All endpoints must serve the **same network**. Each entry is validated like
+`STELLAR_RPC_URL`.
+
+How routing works:
+
+- Every **30 s** a background probe times `getLatestLedger` against each
+  endpoint. Requests go to the endpoint with the lowest p50 over its last 10
+  probes; the others are tried in latency order if it fails.
+- An endpoint that fails **3 consecutive** requests or probes is marked
+  unavailable and re-probed every **60 s**. One successful probe returns it to
+  rotation. Unavailable endpoints are still tried as a last resort, so the
+  indexer keeps going if every endpoint is degraded.
+- JSON-RPC error responses (e.g. an expired cursor) mean the endpoint is
+  reachable, so they do not count towards marking it unavailable.
+
+Metrics, labelled by endpoint origin (`scheme://host[:port]`, so tokens in the
+URL path never reach Prometheus):
+
+| Metric | Meaning |
+| ------ | ------- |
+| `soroban_pulse_rpc_endpoint_latency_ms{endpoint}` | p50 probe latency |
+| `soroban_pulse_rpc_endpoint_available{endpoint}` | `1` in rotation, `0` marked unavailable |
+| `soroban_pulse_rpc_failover_total` | Requests served by a different endpoint than the previous one |
+
+Additional networks configured with `ADDITIONAL_CHAIN_IDS` use only their own
+`STELLAR_RPC_URL_<CHAIN_ID>` endpoint; they never fail over to the primary
+network's endpoints.
 
 ### `ALLOW_INSECURE_RPC`
 
@@ -662,8 +812,42 @@ DATABASE_URL=postgres://user:pass@localhost:5432/soroban_pulse_verify \
 | `ENVIRONMENT`       | Deployment environment (`development`/`staging`/`production`)                     | `development` |
 | `BEHIND_PROXY`      | Trust `X-Forwarded-For` from upstream proxy/load balancer                         | `false`       |
 | `DATABASE_URL_FILE` | Path to a file containing the database URL (takes precedence over `DATABASE_URL`) | —             |
+| `ALLOWED_CALLBACK_DOMAINS` | Comma-separated list of domains permitted as OAuth callback URLs (see below) | — (all rejected) |
 
 See the root [README](../README.md) for all other variables.
+
+### `ALLOWED_CALLBACK_DOMAINS`
+
+The GitHub, Slack, and Telegram integration handlers accept a callback URL as
+user input. Without validation, an attacker could point the callback at a
+malicious domain and have OAuth tokens or authorization codes redirected there.
+To prevent this, every callback URL is validated against an allowlist before it
+is stored.
+
+Set `ALLOWED_CALLBACK_DOMAINS` to a comma-separated list of trusted domains:
+
+```bash
+ALLOWED_CALLBACK_DOMAINS=app.example.com,integrations.example.com
+```
+
+Behaviour:
+
+- **Matching** — the host of the submitted callback URL must exactly match one
+  of the listed domains (case-insensitive). Subdomains are not implicitly
+  allowed; list each one explicitly (e.g. `app.example.com` does not permit
+  `evil.app.example.com`).
+- **Rejection** — if the callback URL's domain is not in the allowlist, the
+  handler responds with `400 Bad Request` and a clear error message, and the
+  URL is not persisted.
+- **Default** — when the variable is unset or empty, the allowlist is empty and
+  **all** callback URLs are rejected. This fail-closed default means you must
+  configure the variable to enable the integration flows.
+- **Validation** — URLs must be absolute and parseable; malformed URLs are
+  rejected with the same `400 Bad Request` response.
+
+Configure this variable in every environment where the integration handlers are
+exposed, and keep it in sync with the domains you actually control.
+=======
 
 ---
 
@@ -675,6 +859,7 @@ See the root [README](../README.md) for all other variables.
 - [ ] Certificates are auto-renewed (certbot timer or Caddy/ACM managed)
 - [ ] `ENVIRONMENT=production` is set in production
 - [ ] `ALLOWED_ORIGINS` lists only known domains (no `*`)
+- [ ] `ALLOWED_CALLBACK_DOMAINS` lists only trusted OAuth callback domains
 - [ ] `API_KEY` is set and rotated regularly
 - [ ] Secrets are managed via Docker Secrets, Kubernetes Secrets, or a vault — not plain `.env` files
 - [ ] Database backups are scheduled and restore procedure is tested

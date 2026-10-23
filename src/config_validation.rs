@@ -16,18 +16,10 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
-//! let report = config_validation::validate(&config);
-//! if !report.is_ok() {
-//!     for err in &report.errors {
-//!         tracing::error!(error = err.as_str(), "Configuration error");
-//!     }
-//!     std::process::exit(1);
-//! }
-//! for warn in &report.warnings {
-//!     tracing::warn!(warning = warn.as_str(), "Configuration warning");
-//! }
-//! ```
+//! [`validate`] is invoked by `ConfigBuilder::build` (issue #1247), which
+//! merges its errors with parse errors into a single `ConfigError` and logs
+//! the warnings — callers should build configs through the builder rather
+//! than calling this directly.
 
 use serde::Serialize;
 use tracing::{info, warn, error};
@@ -91,6 +83,7 @@ pub fn validate(cfg: &Config) -> ConfigValidationReport {
 
     check_database(&mut report, cfg);
     check_rpc(&mut report, cfg);
+    check_cors(&mut report, cfg);
     check_pool_sizing(&mut report, cfg);
     check_auth(&mut report, cfg);
     check_webhook(&mut report, cfg);
@@ -112,7 +105,10 @@ pub fn validate(cfg: &Config) -> ConfigValidationReport {
 
 fn check_database(report: &mut ConfigValidationReport, cfg: &Config) {
     if cfg.database_url.is_empty() {
-        report.add_error("DATABASE_URL must not be empty");
+        report.add_error(
+            "DATABASE_URL is not set. Expected a PostgreSQL connection string \
+             (e.g., postgres://user:pass@localhost/soroban_pulse).",
+        );
     } else if !cfg.database_url.starts_with("postgres://")
         && !cfg.database_url.starts_with("postgresql://")
     {
@@ -137,13 +133,18 @@ fn check_database(report: &mut ConfigValidationReport, cfg: &Config) {
 }
 
 fn check_rpc(report: &mut ConfigValidationReport, cfg: &Config) {
-    if cfg.stellar_rpc_url.is_empty() {
-        report.add_error("STELLAR_RPC_URL must not be empty");
-    } else if !cfg.stellar_rpc_url.starts_with("https://")
-        && !cfg.stellar_rpc_url.starts_with("http://")
-    {
-        report.add_error("STELLAR_RPC_URL must be an http:// or https:// URL");
-    } else if cfg.stellar_rpc_url.starts_with("http://") {
+    // Issue #1247: one rule set for RPC URLs (syntax, scheme, host, private
+    // ranges), shared with the config parser instead of a looser copy here.
+    let mut errors = Vec::new();
+    crate::config::validate_rpc_url_checked(&cfg.stellar_rpc_url, &mut errors);
+    for url in &cfg.stellar_rpc_fallback_urls {
+        crate::config::validate_rpc_url_named("STELLAR_RPC_FALLBACK_URLS", url, &mut errors);
+    }
+    for e in errors {
+        report.add_error(e.trim().to_string());
+    }
+
+    if cfg.stellar_rpc_url.starts_with("http://") {
         report.add_warning(
             "STELLAR_RPC_URL uses plain HTTP — consider HTTPS for production",
         );
@@ -154,6 +155,23 @@ fn check_rpc(report: &mut ConfigValidationReport, cfg: &Config) {
     }
     if cfg.rpc_request_timeout_secs == 0 {
         report.add_warning("RPC_REQUEST_TIMEOUT_SECS=0 disables the RPC request timeout");
+    }
+}
+
+/// Moved here from `Config::from_env` (issue #1247) so it runs once, in
+/// `ConfigBuilder::build`, for both env-loaded and builder-constructed configs.
+fn check_cors(report: &mut ConfigValidationReport, cfg: &Config) {
+    if cfg.environment.is_production_like() && cfg.allowed_origins.iter().any(|o| o == "*") {
+        report.add_error(format!(
+            "ALLOWED_ORIGINS=* is not permitted in {:?}. \
+             Set explicit origins (e.g., https://app.example.com) or use ENVIRONMENT=development.",
+            cfg.environment
+        ));
+    }
+    // Issue #938: fail fast on malformed origins instead of letting
+    // build_cors() silently drop them from the CORS layer.
+    for msg in crate::middleware::validate_cors_origins(&cfg.allowed_origins) {
+        report.add_error(msg);
     }
 }
 
@@ -485,6 +503,13 @@ pub fn config_schema() -> Vec<ConfigFieldDoc> {
             env_var: "STELLAR_RPC_URL",
             description: "Soroban RPC endpoint URL",
             default: Some("https://soroban-testnet.stellar.org"),
+            required: false,
+            category: "rpc",
+        },
+        ConfigFieldDoc {
+            env_var: "STELLAR_RPC_URLS",
+            description: "Comma-separated RPC endpoints for the same network; requests go to the lowest-latency healthy one. Overrides STELLAR_RPC_URL",
+            default: None,
             required: false,
             category: "rpc",
         },

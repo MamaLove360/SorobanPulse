@@ -1,12 +1,12 @@
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::time::Duration;
-use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::notification_channel::NotificationChannel;
+use crate::notification_delivery::NotificationError;
 use crate::{metrics, models::SorobanEvent, retry_policy::RetryPolicy};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,110 +38,72 @@ impl SmsNotifier {
         contract_filter: Vec<String>,
         retry_policy: RetryPolicy,
         pool: sqlx::PgPool,
-    ) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to build SMS HTTP client");
+    ) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            Client::builder().timeout(Duration::from_secs(30)),
+            "SMS",
+        )?;
 
-        Self {
+        Ok(Self {
             client,
             config,
             contract_filter,
             retry_policy,
             pool,
-        }
-    }
-
-    pub fn spawn(
-        self,
-        mut event_rx: broadcast::Receiver<SorobanEvent>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            loop {
-                match event_rx.recv().await {
-                    Ok(event) => {
-                        // Apply contract filter if configured
-                        if !self.contract_filter.is_empty()
-                            && !self.contract_filter.contains(&event.contract_id)
-                        {
-                            continue;
-                        }
-
-                        // Check if this is a critical event (customize logic as needed)
-                        if self.is_critical_event(&event) {
-                            for phone_number in &self.config.to_numbers {
-                                let message = self.format_sms_message(&event);
-                                self.send_sms(phone_number.clone(), message, &event).await;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(
-                            skipped = n,
-                            "SMS notifier lagged, some events skipped"
-                        );
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
         })
     }
 
     fn is_critical_event(&self, event: &SorobanEvent) -> bool {
-        // Customize this logic based on your needs
-        // For now, consider all contract events as potentially critical
-        matches!(event.event_type, crate::models::EventType::Contract)
+        // For now, consider all contract events as potentially critical.
+        event.event_type == "contract"
     }
 
     fn format_sms_message(&self, event: &SorobanEvent) -> String {
+        let short_contract = event.contract_id.get(..8).unwrap_or(&event.contract_id);
         let base_message = format!(
             "Soroban Alert: {} event on contract {} at ledger {}",
-            event.event_type,
-            &event.contract_id[..8], // Truncate contract ID
-            event.ledger
+            event.event_type, short_contract, event.ledger
         );
 
-        // Truncate to 140 chars to leave room for link
-        let truncated = if base_message.len() > 140 {
-            format!("{}...", &base_message[..137])
-        } else {
-            base_message
+        // Truncate to 140 chars to leave room for the link.
+        let truncated = match base_message.char_indices().nth(137) {
+            Some((idx, _)) if base_message.chars().count() > 140 => {
+                format!("{}...", &base_message[..idx])
+            }
+            _ => base_message,
         };
 
-        // Add link to full event (customize URL as needed)
-        format!("{} View: https://soroban-pulse.com/events/{}", truncated, event.id)
+        let event_ref = event
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| event.tx_hash.clone());
+        format!("{} View: https://soroban-pulse.com/events/{}", truncated, event_ref)
     }
 
-    async fn send_sms(&self, phone_number: String, message: String, event: &SorobanEvent) {
+    /// Send one SMS, persisting its status in `sms_notifications`. Returns the
+    /// Twilio message SID on success.
+    async fn send_sms(&self, phone_number: &str, message: &str, event: &SorobanEvent) -> Result<String, String> {
         let notification_id = Uuid::new_v4();
 
-        // Insert pending notification
         if let Err(e) = sqlx::query(
             "INSERT INTO sms_notifications (id, phone_number, message, status) VALUES ($1, $2, $3, 'pending')"
         )
         .bind(notification_id)
-        .bind(&phone_number)
-        .bind(&message)
+        .bind(phone_number)
+        .bind(message)
         .execute(&self.pool)
         .await
         {
             error!(error = %e, "Failed to insert SMS notification record");
-            return;
+            return Err(format!("failed to record SMS notification: {e}"));
         }
 
-        let result = self.retry_policy.execute_with_retry(|attempt| {
-            let client = self.client.clone();
-            let config = &self.config;
-            let phone_number = phone_number.clone();
-            let message = message.clone();
-            
-            async move {
-                self.send_twilio_sms(&client, config, &phone_number, &message, attempt).await
-            }
-        }).await;
+        let result = self
+            .retry_policy
+            .execute_with_retry(|attempt| self.send_twilio_sms(&self.client, &self.config, phone_number, message, attempt))
+            .await;
 
-        match result {
+        match &result {
             Ok(twilio_sid) => {
                 info!(
                     phone_number = %phone_number,
@@ -150,11 +112,10 @@ impl SmsNotifier {
                     "SMS sent successfully"
                 );
 
-                // Update notification record
                 if let Err(e) = sqlx::query(
                     "UPDATE sms_notifications SET twilio_sid = $1, status = 'sent', sent_at = NOW() WHERE id = $2"
                 )
-                .bind(&twilio_sid)
+                .bind(twilio_sid)
                 .bind(notification_id)
                 .execute(&self.pool)
                 .await
@@ -172,11 +133,10 @@ impl SmsNotifier {
                     "SMS delivery failed after all retries"
                 );
 
-                // Update notification record with error
                 if let Err(e) = sqlx::query(
                     "UPDATE sms_notifications SET status = 'failed', error_message = $1 WHERE id = $2"
                 )
-                .bind(&error_msg)
+                .bind(error_msg)
                 .bind(notification_id)
                 .execute(&self.pool)
                 .await
@@ -187,6 +147,8 @@ impl SmsNotifier {
                 metrics::increment_counter("soroban_pulse_sms_notifications_total", &[("status", "failure")]);
             }
         }
+
+        result
     }
 
     async fn send_twilio_sms(
@@ -278,85 +240,94 @@ impl crate::notification_delivery::DeliveryChannel for SmsNotifier {
     }
 }
 
+/// Issue #1245: SMS participates in the unified [`NotificationChannel`]
+/// dispatch path. One event fans out to every configured recipient.
+#[async_trait::async_trait]
+impl NotificationChannel for SmsNotifier {
+    fn channel_name(&self) -> &'static str {
+        "sms"
+    }
+
+    fn accepts(&self, event: &SorobanEvent) -> bool {
+        (self.contract_filter.is_empty() || self.contract_filter.contains(&event.contract_id))
+            && self.is_critical_event(event)
+    }
+
+    /// Returns the comma-separated Twilio SIDs of the messages sent. Fails
+    /// only if no recipient could be reached.
+    async fn send_event_notification(&self, event: &SorobanEvent) -> Result<String, NotificationError> {
+        let message = self.format_sms_message(event);
+        let mut sids = Vec::new();
+        let mut last_error = None;
+        for phone_number in &self.config.to_numbers {
+            match self.send_sms(phone_number, &message, event).await {
+                Ok(sid) => sids.push(sid),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        match last_error {
+            Some(e) if sids.is_empty() => Err(NotificationError::Transient(e)),
+            _ => Ok(sids.join(",")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{EventType, SorobanEvent};
-    use chrono::Utc;
-    use serde_json::json;
 
-    #[test]
-    fn test_format_sms_message() {
+    fn notifier(contract_filter: Vec<String>) -> SmsNotifier {
         let config = TwilioConfig {
             account_sid: "test".to_string(),
             auth_token: SecretString::new("test".to_string()),
             from_number: "+1234567890".to_string(),
             to_numbers: vec!["+0987654321".to_string()],
         };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://test")
+            .unwrap();
+        SmsNotifier::new(config, contract_filter, RetryPolicy::sms_default(), pool).unwrap()
+    }
 
-        let pool = sqlx::PgPool::connect("postgresql://test").await.unwrap();
-        let notifier = SmsNotifier::new(
-            config,
-            vec![],
-            RetryPolicy::sms_default(),
-            pool,
-        );
-
-        let event = SorobanEvent {
-            id: Uuid::new_v4(),
-            contract_id: "CABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890".to_string(),
-            event_type: EventType::Contract,
+    fn event(contract_id: &str, event_type: &str) -> SorobanEvent {
+        SorobanEvent {
+            id: Some(Uuid::new_v4()),
+            contract_id: contract_id.to_string(),
+            event_type: event_type.to_string(),
             tx_hash: "test_hash".to_string(),
             ledger: 12345,
-            timestamp: Utc::now(),
-            event_data: json!({"test": "data"}),
-        };
+            ..SorobanEvent::default()
+        }
+    }
 
-        let message = notifier.format_sms_message(&event);
+    #[tokio::test]
+    async fn test_format_sms_message() {
+        let message = notifier(vec![]).format_sms_message(&event("CABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890", "contract"));
         assert!(message.len() <= 160);
         assert!(message.contains("CABCDEFG")); // Truncated contract ID
         assert!(message.contains("12345")); // Ledger number
         assert!(message.contains("https://soroban-pulse.com/events/"));
     }
 
-    #[test]
-    fn test_is_critical_event() {
-        let config = TwilioConfig {
-            account_sid: "test".to_string(),
-            auth_token: SecretString::new("test".to_string()),
-            from_number: "+1234567890".to_string(),
-            to_numbers: vec!["+0987654321".to_string()],
-        };
+    #[tokio::test]
+    async fn format_sms_message_handles_short_contract_ids() {
+        let message = notifier(vec![]).format_sms_message(&event("C1", "contract"));
+        assert!(message.contains("contract C1 at ledger"));
+    }
 
-        let pool = sqlx::PgPool::connect("postgresql://test").await.unwrap();
-        let notifier = SmsNotifier::new(
-            config,
-            vec![],
-            RetryPolicy::sms_default(),
-            pool,
-        );
+    #[tokio::test]
+    async fn test_is_critical_event() {
+        let n = notifier(vec![]);
+        assert!(n.is_critical_event(&event("test", "contract")));
+        assert!(!n.is_critical_event(&event("test", "system")));
+    }
 
-        let contract_event = SorobanEvent {
-            id: Uuid::new_v4(),
-            contract_id: "test".to_string(),
-            event_type: EventType::Contract,
-            tx_hash: "test".to_string(),
-            ledger: 1,
-            timestamp: Utc::now(),
-            event_data: json!({}),
-        };
-
-        let system_event = SorobanEvent {
-            id: Uuid::new_v4(),
-            contract_id: "test".to_string(),
-            event_type: EventType::System,
-            tx_hash: "test".to_string(),
-            ledger: 1,
-            timestamp: Utc::now(),
-            event_data: json!({}),
-        };
-
-        assert!(notifier.is_critical_event(&contract_event));
-        assert!(!notifier.is_critical_event(&system_event));
+    #[tokio::test]
+    async fn channel_accepts_respects_contract_filter_and_criticality() {
+        let n = notifier(vec!["CWATCHED".to_string()]);
+        assert_eq!(NotificationChannel::channel_name(&n), "sms");
+        assert!(n.accepts(&event("CWATCHED", "contract")));
+        assert!(!n.accepts(&event("COTHER", "contract")));
+        assert!(!n.accepts(&event("CWATCHED", "system")));
     }
 }

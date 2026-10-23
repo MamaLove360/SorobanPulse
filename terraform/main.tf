@@ -1,5 +1,5 @@
 # =============================================================================
-# Root Module — SorobanPulse Infrastructure (Issue #650, #833)
+# Root Module — SorobanPulse Infrastructure (Issue #650, #833, #1283)
 #
 # Wires together:
 #   - VPC + subnets + NAT gateway
@@ -8,7 +8,21 @@
 #   - ECS Fargate service
 #   - Automated backup storage
 #   - Monitoring / CloudWatch alarms
+#
+# Remote state is stored in S3 with DynamoDB locking (see docs/terraform.md).
+# The `environment` variable drives the name_prefix for every module, so the
+# same configuration can target dev/staging/production via TF_WORKSPACE.
 # =============================================================================
+
+terraform {
+  backend "s3" {
+    bucket         = "soroban-pulse-terraform-state"
+    key            = "terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "soroban-pulse-terraform-locks"
+    encrypt        = true
+  }
+}
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"

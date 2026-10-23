@@ -12,7 +12,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 soroban-pulse = { path = "..", features = [] }
 serde_json = "1"
-stellar-xdr = { version = "0.0.18", features = ["curr"] }
+# Must match the stellar-xdr API used by the library (`Limits`, serde JSON for
+# `ScVal`); the old 0.0.18 pin without `serde` left fuzz_xdr_scval unbuildable.
+stellar-xdr = { version = "22", features = ["curr", "serde"] }
 
 # Prevent this from interfering with the workspace
 [workspace]

@@ -416,6 +416,54 @@ curl -H "X-Api-Key: sk_prod_abc123" \
      https://api.example.com/v1/rate-limit/status
 ```
 
+## Endpoint-Specific Rate Limits
+
+In addition to the per-API-key limits described above, certain endpoints have
+stricter, per-IP limits to protect backend resources from abuse.
+
+### `POST /v1/subscriptions`
+
+Webhook subscription registration is limited to **5 requests per minute per IP**
+(the global limit is 60 requests per minute). This prevents an attacker from
+exhausting database connections by spamming subscription creation.
+
+The 6th request from the same IP within a one-minute window returns
+`429 Too Many Requests`.
+
+### `GET /v1/events/stream`
+
+Server-Sent Events (SSE) connections are limited to **5 concurrent connections
+per IP**. Concurrent connection counts are tracked in-memory (using `dashmap`).
+
+The 6th concurrent SSE connection from the same IP returns
+`429 Too Many Requests`. The slot is released when the connection closes.
+
+### 429 Responses
+
+Both endpoints return `429 Too Many Requests` with a `Retry-After` header
+indicating the number of seconds to wait before retrying:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+```
+
+```json
+{
+  "error": "Rate limit exceeded",
+  "detail": "Too many requests from this IP"
+}
+```
+
+### Metrics
+
+Rate-limited requests are counted with the following Prometheus counters:
+
+| Metric | Description |
+|--------|-------------|
+| `soroban_pulse_subscription_rate_limited_total` | Number of `POST /v1/subscriptions` requests rejected by the per-IP rate limit |
+| `soroban_pulse_sse_rate_limited_total` | Number of `GET /v1/events/stream` connections rejected by the per-IP connection limit |
+
 ## See Also
 
 - [API Authentication](./api_authentication.md)

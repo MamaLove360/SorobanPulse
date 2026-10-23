@@ -453,7 +453,9 @@ pub fn forecast_next_points(series: &TimeSeriesSeries, count: usize) -> Vec<Time
     // Determine the bucket duration so we can advance timestamps correctly.
     let bucket_dur = granularity_to_duration(&series.granularity);
 
-    let last_point = series.points.last().unwrap();
+    let Some(last_point) = series.points.last() else {
+        return vec![];
+    };
     let last_ts = last_point.timestamp;
     let last_x = (n - 1) as f64;
 

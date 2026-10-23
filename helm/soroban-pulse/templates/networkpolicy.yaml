@@ -21,9 +21,12 @@ spec:
         {{- if .Values.networkPolicy.ingressController.namespaceSelector }}
         - namespaceSelector:
             {{- toYaml .Values.networkPolicy.ingressController.namespaceSelector | nindent 12 }}
-        {{- end }}
-        {{- if .Values.networkPolicy.ingressController.podSelector }}
-          podSelector:
+            {{- if .Values.networkPolicy.ingressController.podSelector }}
+            podSelector:
+              {{- toYaml .Values.networkPolicy.ingressController.podSelector | nindent 14 }}
+            {{- end }}
+        {{- else if .Values.networkPolicy.ingressController.podSelector }}
+        - podSelector:
             {{- toYaml .Values.networkPolicy.ingressController.podSelector | nindent 12 }}
         {{- end }}
       ports:
@@ -35,9 +38,12 @@ spec:
         {{- if .Values.networkPolicy.prometheus.namespaceSelector }}
         - namespaceSelector:
             {{- toYaml .Values.networkPolicy.prometheus.namespaceSelector | nindent 12 }}
-        {{- end }}
-        {{- if .Values.networkPolicy.prometheus.podSelector }}
-          podSelector:
+            {{- if .Values.networkPolicy.prometheus.podSelector }}
+            podSelector:
+              {{- toYaml .Values.networkPolicy.prometheus.podSelector | nindent 14 }}
+            {{- end }}
+        {{- else if .Values.networkPolicy.prometheus.podSelector }}
+        - podSelector:
             {{- toYaml .Values.networkPolicy.prometheus.podSelector | nindent 12 }}
         {{- end }}
       ports:
@@ -56,12 +62,12 @@ spec:
     # PostgreSQL
     - ports:
         - protocol: TCP
-          port: {{ .Values.networkPolicy.egress.postgresPort }}
+          port: {{ .Values.networkPolicy.egress.postgresPort | default 5432 }}
 
     # Stellar Soroban RPC (HTTPS)
     - ports:
         - protocol: TCP
-          port: {{ .Values.networkPolicy.egress.rpcPort }}
+          port: {{ .Values.networkPolicy.egress.rpcPort | default 443 }}
 
     {{- with .Values.networkPolicy.egress.extraPorts }}
     # User-defined extra egress ports

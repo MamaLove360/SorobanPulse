@@ -1,0 +1,49 @@
+name: Publish VS Code Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        working-directory: vscode-extension
+        run: npm ci
+
+      - name: Compile TypeScript
+        working-directory: vscode-extension
+        run: npm run compile
+
+      - name: Package extension
+        working-directory: vscode-extension
+        run: npm run package
+
+      - name: Publish to VS Code Marketplace
+        working-directory: vscode-extension
+        env:
+          VSCE_TOKEN: ${{ secrets.VSCE_TOKEN }}
+        run: npm run publish
+
+      - name: Publish to Open VSX
+        working-directory: vscode-extension
+        env:
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+        run: npm run publish:ovsx
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: vscode-extension/*.vsix
+          draft: false
+          prerelease: ${{ contains(github.ref, '-pre') || contains(github.ref, '-rc') || contains(github.ref, '-alpha') || contains(github.ref, '-beta') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

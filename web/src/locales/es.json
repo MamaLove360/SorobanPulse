@@ -1,0 +1,59 @@
+{
+  "nav": {
+    "eventExplorer": "Explorador de Eventos",
+    "liveStream": "Transmisión en Vivo",
+    "status": "Estado",
+    "admin": "Administrador",
+    "toggleTheme": "Cambiar tema"
+  },
+  "eventExplorer": {
+    "title": "Explorador de Eventos",
+    "contractIdPlaceholder": "ID del Contrato",
+    "eventTypePlaceholder": "Tipo de Evento",
+    "fromLedgerPlaceholder": "Desde Ledger",
+    "toLedgerPlaceholder": "Hasta Ledger",
+    "loading": "Cargando...",
+    "error": "Error: {{message}}",
+    "noEvents": "No se encontraron eventos",
+    "id": "ID",
+    "contractId": "ID del Contrato",
+    "type": "Tipo",
+    "ledger": "Ledger",
+    "timestamp": "Marca de Tiempo",
+    "actions": "Acciones",
+    "copyId": "Copiar ID"
+  },
+  "status": {
+    "title": "Estado del Sistema",
+    "indexerHealth": "Salud del Indexador",
+    "status": "Estado",
+    "ready": "Listo",
+    "notReady": "No Listo",
+    "lag": "Retraso (bloques)",
+    "currentLedger": "Ledger Actual",
+    "database": "Base de Datos",
+    "connectionPool": "Grupo de Conexión",
+    "rpc": "RPC",
+    "errorRate5min": "Tasa de Error (5min)",
+    "sseConnections": "Conexiones SSE"
+  },
+  "admin": {
+    "title": "Consola de Administración",
+    "adminKey": "Clave de Administrador",
+    "authenticate": "Autenticar",
+    "indexerControl": "Control del Indexador",
+    "indexerStatus": "Estado",
+    "role": "Rol",
+    "leader": "Líder",
+    "standby": "Reserva",
+    "replicas": "Réplicas",
+    "pause": "Pausar",
+    "resume": "Reanudar",
+    "replayTrigger": "Activador de Repetición",
+    "fromLedger": "Desde Ledger",
+    "toLedger": "Hasta Ledger",
+    "dryRun": "Simulación",
+    "triggerReplay": "Activar Repetición",
+    "lagTimeSeries": "Series Temporales de Retraso (últimos 5 min)"
+  }
+}

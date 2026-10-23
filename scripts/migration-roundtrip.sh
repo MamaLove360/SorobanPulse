@@ -14,11 +14,36 @@
 # Connection uses the standard libpq env vars (PGHOST, PGPORT, PGUSER,
 # PGPASSWORD). Scratch databases are dropped and recreated on every run.
 #
-# Usage: scripts/migration-roundtrip.sh [migrations-dir]
+# Usage: scripts/migration-roundtrip.sh [--check-only] [migrations-dir]
+#
+# --check-only validates that every up migration has a matching .down.sql file
+# without connecting to a database. CI uses it as a fast pre-check.
 
 set -euo pipefail
 
-MIGRATIONS_DIR="${1:-migrations}"
+CHECK_ONLY=0
+MIGRATIONS_DIR=""
+for arg in "$@"; do
+    case "$arg" in
+        --check-only) CHECK_ONLY=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--check-only] [migrations-dir]"
+            exit 0
+            ;;
+        -*)
+            echo "ERROR: unknown option: $arg" >&2
+            exit 2
+            ;;
+        *)
+            if [ -n "$MIGRATIONS_DIR" ]; then
+                echo "ERROR: unexpected argument: $arg" >&2
+                exit 2
+            fi
+            MIGRATIONS_DIR="$arg"
+            ;;
+    esac
+done
+MIGRATIONS_DIR="${MIGRATIONS_DIR:-migrations}"
 STEP_DB="migration_roundtrip_step"
 FULL_DB="migration_roundtrip_full"
 WORK_DIR="$(mktemp -d)"
@@ -100,6 +125,11 @@ fi
 
 echo "Checking ${#UPS[@]} migrations"
 
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    echo "✓ All ${#UPS[@]} migrations have a matching down migration"
+    exit 0
+fi
+
 # === Per migration: apply N, revert N, apply N
 
 recreate_db "$STEP_DB"
@@ -112,7 +142,9 @@ for up in "${UPS[@]}"; do
     run_file "$STEP_DB" "$up" || die "$up" "up migration failed"
     dump_schema "$STEP_DB" "$WORK_DIR/after.sql"
 
-    run_file "$STEP_DB" "$down" || die "$down" "down migration failed"
+    if ! run_file "$STEP_DB" "$down"; then
+        die "$down" "down migration failed while reverting $(basename "$up")"
+    fi
     dump_schema "$STEP_DB" "$WORK_DIR/reverted.sql"
     diff -u "$WORK_DIR/before.sql" "$WORK_DIR/reverted.sql" >"$WORK_DIR/diff.txt" \
         || die "$down" "down migration does not restore the schema from before $(basename "$up")" "$WORK_DIR/diff.txt"
@@ -137,7 +169,9 @@ dump_schema "$FULL_DB" "$WORK_DIR/first.sql"
 
 for ((i = ${#UPS[@]} - 1; i >= 0; i--)); do
     down="$(down_for "${UPS[$i]}")"
-    run_file "$FULL_DB" "$down" || die "$down" "down migration failed while reverting all migrations"
+    if ! run_file "$FULL_DB" "$down"; then
+        die "$down" "down migration failed while reverting all migrations (reverting $(basename "${UPS[$i]}"))"
+    fi
 done
 dump_schema "$FULL_DB" "$WORK_DIR/reverted.sql"
 diff -u "$WORK_DIR/empty.sql" "$WORK_DIR/reverted.sql" >"$WORK_DIR/diff.txt" \

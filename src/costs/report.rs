@@ -20,10 +20,30 @@ pub fn generate_report(calculator: &CostCalculator, hours: i64) -> CostReport {
 }
 
 /// Generate a cost forecast for the next `forecast_days` days.
+///
+/// Per spec Requirement 6, the linear-regression model in [`forecast`] is fed
+/// with the last 14 days of recorded entries. If fewer than 7 days of history
+/// are available the forecast is rejected as "insufficient data" and `None`
+/// is returned.
 pub fn generate_forecast(calculator: &CostCalculator, forecast_days: u32) -> Option<CostForecast> {
-    // Pull all entries recorded so far for regression input.
-    let report = calculator.report(Utc::now() - Duration::days(30));
+    // Pull the last 14 days of entries for regression input.
+    let report = calculator.report(Utc::now() - Duration::days(14));
     let entries: Vec<_> = report.breakdown.details.values().cloned().collect();
+
+    // Require at least 7 days of history before forecasting.
+    let oldest = entries.iter().map(|e| e.timestamp).min();
+    let has_enough_history = match oldest {
+        Some(ts) => Utc::now().signed_duration_since(ts) >= Duration::days(7),
+        None => false,
+    };
+    if !has_enough_history {
+        warn!(
+            entry_count = entries.len(),
+            "Insufficient cost history for forecast (need >= 7 days)"
+        );
+        return None;
+    }
+
     forecast::forecast(&entries, forecast_days)
 }
 

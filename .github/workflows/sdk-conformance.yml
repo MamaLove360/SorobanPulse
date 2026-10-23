@@ -5,6 +5,12 @@ on:
   push:
     branches: [main]
   pull_request:
+    paths:
+      - "sdk/**"
+      - "openapi.json"
+      - "tests/sdk_conformance/**"
+      - "docker-compose.conformance.yml"
+      - ".github/workflows/sdk-conformance.yml"
 
 concurrency:
   group: sdk-conformance-${{ github.ref }}
@@ -86,15 +92,17 @@ jobs:
           exit 1
 
       # ── 7. Run SDK conformance runners ───────────────────────────────────────
-      # Each runner exits 0 on full pass, 1 on any failure.
-      # We run all three regardless of individual failures and collect the exit
-      # codes so the job summary shows pass/fail for every SDK.
+      # Each runner reads the shared scenarios from tests/sdk_conformance/scenarios.json
+      # and writes a normalized per-scenario result map to $CONFORMANCE_RESULTS_FILE.
+      # We run all three regardless of individual failures so we can diff results.
 
       - name: Run TypeScript conformance runner
         id: runner_ts
         working-directory: sdk/conformance/runner_ts
         env:
           CONFORMANCE_BASE_URL: http://localhost:3000
+          CONFORMANCE_SCENARIOS: ${{ github.workspace }}/tests/sdk_conformance/scenarios.json
+          CONFORMANCE_RESULTS_FILE: ${{ runner.temp }}/results_ts.json
         run: npx ts-node runner.ts
         continue-on-error: true
 
@@ -103,6 +111,8 @@ jobs:
         working-directory: sdk/conformance/runner_python
         env:
           CONFORMANCE_BASE_URL: http://localhost:3000
+          CONFORMANCE_SCENARIOS: ${{ github.workspace }}/tests/sdk_conformance/scenarios.json
+          CONFORMANCE_RESULTS_FILE: ${{ runner.temp }}/results_python.json
         run: python runner.py
         continue-on-error: true
 
@@ -111,55 +121,171 @@ jobs:
         working-directory: sdk/conformance/runner_go
         env:
           CONFORMANCE_BASE_URL: http://localhost:3000
+          CONFORMANCE_SCENARIOS: ${{ github.workspace }}/tests/sdk_conformance/scenarios.json
+          CONFORMANCE_RESULTS_FILE: ${{ runner.temp }}/results_go.json
         run: go run runner.go
         continue-on-error: true
 
-      # ── 8. Write per-SDK pass/fail to the job summary ───────────────────────
+      # ── 8. Diff per-scenario results across SDKs ─────────────────────────────
+      # Each results file is a JSON object mapping scenario id -> boolean pass.
+      # Any scenario whose outcome differs between SDKs is a conformance failure.
+      - name: Compare SDK results
+        id: compare
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          tmp = os.environ["RUNNER_TEMP"]
+          sdks = {"TypeScript": "results_ts.json",
+                  "Python": "results_python.json",
+                  "Go": "results_go.json"}
+
+          results = {}
+          for name, fname in sdks.items():
+              path = os.path.join(tmp, fname)
+              if not os.path.exists(path):
+                  print(f"::warning::{name} produced no results file ({path})")
+                  results[name] = None
+                  continue
+              with open(path) as f:
+                  results[name] = json.load(f)
+
+          # Collect the union of all scenario ids.
+          scenario_ids = set()
+          for r in results.values():
+              if r:
+                  scenario_ids.update(r.keys())
+          scenario_ids = sorted(scenario_ids)
+
+          mismatches = []
+          for sid in scenario_ids:
+              outcomes = {}
+              for name, r in results.items():
+                  if r is None:
+                      outcomes[name] = "missing"
+                  else:
+                      outcomes[name] = "pass" if r.get(sid) is True else "fail"
+              if len(set(outcomes.values())) > 1:
+                  mismatches.append((sid, outcomes))
+
+          # Emit a machine-readable diff for the summary step.
+          with open(os.path.join(tmp, "mismatches.json"), "w") as f:
+              json.dump([{"scenario": s, "outcomes": o} for s, o in mismatches], f)
+
+          if mismatches:
+              print("::error::SDKs returned different results for the same scenarios:")
+              for sid, outcomes in mismatches:
+                  print(f"  {sid}: {outcomes}")
+              sys.exit(1)
+
+          print("✅ All SDKs agree on every scenario.")
+          PY
+        continue-on-error: true
+
+      # ── 9. Write combined summary to the job summary ────────────────────────
       - name: Write final summary
         if: always()
         run: |
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "---" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Overall Result" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SDK | Result |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json, os
 
-          ts_result="${{ steps.runner_ts.outcome }}"
-          py_result="${{ steps.runner_python.outcome }}"
-          go_result="${{ steps.runner_go.outcome }}"
+          tmp = os.environ["RUNNER_TEMP"]
+          sdks = {"TypeScript": "results_ts.json",
+                  "Python": "results_python.json",
+                  "Go": "results_go.json"}
 
-          ts_badge=$([ "$ts_result" = "success" ] && echo "🟢 Pass" || echo "🔴 Fail")
-          py_badge=$([ "$py_result" = "success" ] && echo "🟢 Pass" || echo "🔴 Fail")
-          go_badge=$([ "$go_result" = "success" ] && echo "🟢 Pass" || echo "🔴 Fail")
+          results = {}
+          for name, fname in sdks.items():
+              path = os.path.join(tmp, fname)
+              if os.path.exists(path):
+                  with open(path) as f:
+                      results[name] = json.load(f)
+              else:
+                  results[name] = None
 
-          echo "| TypeScript | $ts_badge |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Python     | $py_badge |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Go         | $go_badge |" >> "$GITHUB_STEP_SUMMARY"
+          scenario_ids = set()
+          for r in results.values():
+              if r:
+                  scenario_ids.update(r.keys())
+          scenario_ids = sorted(scenario_ids)
 
-      # ── 9. Fail the job if any runner reported failures ──────────────────────
-      - name: Assert all runners passed
+          def badge(val):
+              if val is True:
+                  return "🟢 Pass"
+              if val is False:
+                  return "🔴 Fail"
+              return "⚪ Missing"
+
+          lines = []
+          lines.append("")
+          lines.append("---")
+          lines.append("## SDK Conformance Matrix")
+          lines.append("")
+          header = "| Scenario | " + " | ".join(sdks.keys()) + " | Agree |"
+          sep = "|----------|" + "|".join(["------"] * len(sdks)) + "|-------|"
+          lines.append(header)
+          lines.append(sep)
+
+          any_disagree = False
+          for sid in scenario_ids:
+              cells = []
+              vals = []
+              for name in sdks:
+                  r = results[name]
+                  v = None if r is None else r.get(sid)
+                  vals.append(v)
+                  cells.append(badge(v))
+              agree = len(set(vals)) == 1
+              if not agree:
+                  any_disagree = True
+              lines.append(f"| {sid} | " + " | ".join(cells) + f" | {'✅' if agree else '❌'} |")
+
+          lines.append("")
+          lines.append("## Overall Result")
+          lines.append("")
+          lines.append("| SDK | Result |")
+          lines.append("|-----|--------|")
+          for name in sdks:
+              r = results[name]
+              if r is None:
+                  lines.append(f"| {name} | ⚪ No results |")
+              elif all(v is True for v in r.values()) and r:
+                  lines.append(f"| {name} | 🟢 Pass |")
+              else:
+                  lines.append(f"| {name} | 🔴 Fail |")
+          lines.append("")
+          lines.append(f"**Cross-SDK agreement:** {'❌ Mismatches detected' if any_disagree else '✅ All scenarios agree'}")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+
+      # ── 10. Fail the job if any runner failed or results disagree ────────────
+      - name: Assert all runners passed and agree
         if: always()
         run: |
           ts="${{ steps.runner_ts.outcome }}"
           py="${{ steps.runner_python.outcome }}"
           go="${{ steps.runner_go.outcome }}"
+          cmp="${{ steps.compare.outcome }}"
 
           failed=0
           [ "$ts" != "success" ] && echo "❌ TypeScript conformance runner failed" && failed=1
           [ "$py" != "success" ] && echo "❌ Python conformance runner failed"     && failed=1
           [ "$go" != "success" ] && echo "❌ Go conformance runner failed"          && failed=1
+          [ "$cmp" != "success" ] && echo "❌ SDK results disagree across runners"  && failed=1
 
           if [ "$failed" -ne 0 ]; then
             echo ""
-            echo "One or more SDK conformance runners reported failures."
+            echo "One or more SDK conformance runners failed or returned differing results."
             echo "Check the step output and the job summary for details."
             exit 1
           fi
 
-          echo "✅ All SDK conformance runners passed."
+          echo "✅ All SDK conformance runners passed and agree."
 
-      # ── 10. Collect service logs on failure ───────────────────────────────────
+      # ── 11. Collect service logs on failure ───────────────────────────────────
       - name: Dump service logs on failure
         if: failure()
         run: |
@@ -170,7 +296,7 @@ jobs:
           echo "=== webhook-sink logs ==="
           docker compose -f docker-compose.conformance.yml logs webhook-sink --tail=50
 
-      # ── 11. Tear down ─────────────────────────────────────────────────────────
+      # ── 12. Tear down ─────────────────────────────────────────────────────────
       - name: Stop conformance stack
         if: always()
         run: docker compose -f docker-compose.conformance.yml down -v --remove-orphans

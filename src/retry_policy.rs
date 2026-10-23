@@ -129,29 +129,27 @@ impl RetryPolicy {
         Fut: std::future::Future<Output = Result<T, E>>,
         E: std::fmt::Display,
     {
-        let mut last_error = None;
-
-        for attempt in 1..=self.max_attempts {
+        // Always make at least one attempt, even if `max_attempts` is 0.
+        let max_attempts = self.max_attempts.max(1);
+        let mut attempt = 1;
+        loop {
             match operation(attempt).await {
                 Ok(result) => return Ok(result),
-                Err(error) => {
-                    if attempt < self.max_attempts {
-                        let backoff = self.calculate_backoff(attempt);
-                        warn!(
-                            attempt = attempt,
-                            max_attempts = self.max_attempts,
-                            backoff_ms = backoff.as_millis(),
-                            error = %error,
-                            "Operation failed, retrying after backoff"
-                        );
-                        sleep(backoff).await;
-                    }
-                    last_error = Some(error);
+                Err(error) if attempt < max_attempts => {
+                    let backoff = self.calculate_backoff(attempt);
+                    warn!(
+                        attempt = attempt,
+                        max_attempts = max_attempts,
+                        backoff_ms = backoff.as_millis(),
+                        error = %error,
+                        "Operation failed, retrying after backoff"
+                    );
+                    sleep(backoff).await;
+                    attempt += 1;
                 }
+                Err(error) => return Err(error),
             }
         }
-
-        Err(last_error.unwrap())
     }
 
     /// Executes `operation`, recording attempt counts and outcomes into `metrics`
@@ -167,36 +165,35 @@ impl RetryPolicy {
         Fut: std::future::Future<Output = Result<T, E>>,
         E: std::fmt::Display,
     {
-        let mut last_error = None;
-
-        for attempt in 1..=self.max_attempts {
+        // Always make at least one attempt, even if `max_attempts` is 0.
+        let max_attempts = self.max_attempts.max(1);
+        let mut attempt = 1;
+        loop {
             metrics.record_attempt(policy_name);
             match operation(attempt).await {
                 Ok(result) => {
                     metrics.record_success(policy_name, attempt);
                     return Ok(result);
                 }
+                Err(error) if attempt < max_attempts => {
+                    let backoff = self.calculate_backoff(attempt);
+                    metrics.record_retry(policy_name, backoff);
+                    warn!(
+                        attempt = attempt,
+                        max_attempts = max_attempts,
+                        backoff_ms = backoff.as_millis(),
+                        error = %error,
+                        "Operation failed, retrying after backoff"
+                    );
+                    sleep(backoff).await;
+                    attempt += 1;
+                }
                 Err(error) => {
-                    if attempt < self.max_attempts {
-                        let backoff = self.calculate_backoff(attempt);
-                        metrics.record_retry(policy_name, backoff);
-                        warn!(
-                            attempt = attempt,
-                            max_attempts = self.max_attempts,
-                            backoff_ms = backoff.as_millis(),
-                            error = %error,
-                            "Operation failed, retrying after backoff"
-                        );
-                        sleep(backoff).await;
-                    } else {
-                        metrics.record_exhausted(policy_name);
-                    }
-                    last_error = Some(error);
+                    metrics.record_exhausted(policy_name);
+                    return Err(error);
                 }
             }
         }
-
-        Err(last_error.unwrap())
     }
 }
 
@@ -248,7 +245,7 @@ impl RetryMetrics {
     }
 
     fn counters_for(&self, policy_name: &str) -> Arc<PolicyCounters> {
-        let mut guard = self.counters.lock().unwrap();
+        let mut guard = self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .entry(policy_name.to_string())
             .or_insert_with(|| Arc::new(PolicyCounters::default()))
@@ -283,7 +280,7 @@ impl RetryMetrics {
 
     /// Builds a snapshot of all tracked policies for a retry status dashboard.
     pub fn dashboard_snapshot(&self) -> Vec<RetryDashboardEntry> {
-        let guard = self.counters.lock().unwrap();
+        let guard = self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .iter()
             .map(|(name, counters)| {
@@ -440,7 +437,7 @@ mod tests {
         };
         let mut call_count = 0;
 
-        let result = policy.execute_with_retry(|_attempt| {
+        let result: Result<(), &str> = policy.execute_with_retry(|_attempt| {
             call_count += 1;
             async move { Err("persistent error") }
         }).await;

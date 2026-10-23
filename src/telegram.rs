@@ -24,18 +24,18 @@ pub struct TelegramClient {
 }
 
 impl TelegramClient {
-    pub fn new(config: TelegramConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build Telegram HTTP client");
+    pub fn new(config: TelegramConfig) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            Client::builder().timeout(Duration::from_secs(10)),
+            "telegram",
+        )?;
 
-        Self {
+        Ok(Self {
             client,
             bot_token: config.bot_token,
             chat_id: config.chat_id,
             user_subscriptions: HashMap::new(),
-        }
+        })
     }
 
     /// Send a formatted message to Telegram
@@ -306,20 +306,6 @@ impl TelegramClient {
     }
 }
 
-/// Deliver an event to Telegram with retry logic
-pub async fn deliver_telegram(
-    client: &TelegramClient,
-    event: Event,
-) {
-    if let Err(e) = client.send_with_retry(&event, 3).await {
-        error!(
-            error = %e,
-            contract_id = %event.contract_id,
-            event_type = %event.event_type,
-            "Failed to deliver Telegram notification"
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -332,7 +318,7 @@ mod tests {
             chat_id: "-1001234567890".to_string(),
         };
 
-        let client = TelegramClient::new(config);
+        let client = TelegramClient::new(config).unwrap();
         assert_eq!(client.chat_id, "-1001234567890");
         assert!(client.user_subscriptions.is_empty());
     }
@@ -344,7 +330,7 @@ mod tests {
             chat_id: "-1001234567890".to_string(),
         };
 
-        let mut client = TelegramClient::new(config);
+        let mut client = TelegramClient::new(config).unwrap();
 
         client.subscribe_user("user1".to_string(), "chat1".to_string());
         assert!(client.user_subscriptions.contains_key("user1"));

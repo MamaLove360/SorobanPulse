@@ -48,7 +48,7 @@ const FEATURES: Feature[] = [
     title: 'Real-time Indexing',
     description:
       'Continuously polls the Stellar Soroban RPC and persists every contract event to PostgreSQL. Multi-replica safe via advisory locks — only one indexer leads, standbys take over automatically.',
-    href: '/guides/architecture',
+    href: '/docs/architecture',
     linkLabel: 'Architecture →',
   },
   {
@@ -56,7 +56,7 @@ const FEATURES: Feature[] = [
     title: 'Live Streaming (SSE)',
     description:
       'Subscribe to a contract or all events over a single long-lived Server-Sent Events connection. Missed events are replayed on reconnect using Last-Event-ID.',
-    href: '/guides/sse-reconnection',
+    href: '/docs/sse-reconnection',
     linkLabel: 'SSE docs →',
   },
   {
@@ -64,7 +64,7 @@ const FEATURES: Feature[] = [
     title: 'Webhooks',
     description:
       'Push event notifications to any HTTP endpoint with HMAC-SHA256 signatures, automatic retries with exponential back-off, circuit breaker, and per-endpoint rate limiting.',
-    href: '/guides/webhook-verification',
+    href: '/docs/webhook-verification',
     linkLabel: 'Webhook guide →',
   },
   {
@@ -72,7 +72,7 @@ const FEATURES: Feature[] = [
     title: 'Notifications',
     description:
       'Fan out to email, Slack, Discord, PagerDuty, Telegram, and SMS. Deduplication, batching, content filters, and delivery receipts are built in.',
-    href: '/guides/notification-channels',
+    href: '/docs/notification-channels',
     linkLabel: 'Notification channels →',
   },
 ];
@@ -121,7 +121,7 @@ function HeroSection(): JSX.Element {
         <Link className="sp-btn sp-btn--primary" to="/docs/onboarding">
           🚀 Get Started
         </Link>
-        <Link className="sp-btn sp-btn--secondary" to="/guides/api-guide">
+        <Link className="sp-btn sp-btn--secondary" to="/docs/api-guide">
           API Reference
         </Link>
         <Link
@@ -212,7 +212,7 @@ function QuickStartSection(): JSX.Element {
         <Link className="sp-btn sp-btn--primary" to="/docs/onboarding">
           Full onboarding guide →
         </Link>
-        <Link className="sp-btn sp-btn--secondary" to="/guides/development-setup">
+        <Link className="sp-btn sp-btn--secondary" to="/docs/development-setup">
           Dev environment setup
         </Link>
       </div>
@@ -243,10 +243,10 @@ function BottomCTA(): JSX.Element {
         Check out the SDK integration guide or explore the interactive API docs.
       </p>
       <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
-        <Link className="sp-btn sp-btn--primary" to="/guides/sdk-integration-guide">
+        <Link className="sp-btn sp-btn--primary" to="/docs/sdk-integration-guide">
           SDK Integration Guide
         </Link>
-        <Link className="sp-btn sp-btn--secondary" href="/docs">
+        <Link className="sp-btn sp-btn--secondary" to="/api-reference">
           Open API Explorer ↗
         </Link>
       </div>

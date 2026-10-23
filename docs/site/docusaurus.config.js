@@ -17,7 +17,9 @@ const config = {
   organizationName: 'Soroban-Pulse',
   projectName: 'SorobanPulse',
 
-  onBrokenLinks: 'throw',
+  // Many docs link to repository files outside docs/ (README.md, helm/, …),
+  // which are not site pages; the lychee job in docs.yml checks real links.
+  onBrokenLinks: 'warn',
   onBrokenMarkdownLinks: 'warn',
 
   i18n: {
@@ -29,19 +31,30 @@ const config = {
   // Plugins
   // ---------------------------------------------------------------------------
   plugins: [
-    // Docs-only plugin instances for each IA section so they can live under
-    // their own URL prefix and have independent sidebars.
+    // Pages merged into another doc keep working via client-side redirects
+    // (Issue #1170).
     [
-      '@docusaurus/plugin-content-docs',
+      '@docusaurus/plugin-client-redirects',
       {
-        id: 'guides',
-        path: '../../docs',
-        routeBasePath: 'guides',
-        sidebarPath: require.resolve('./sidebars/guides.js'),
-        // Automatically generate sidebar from folder structure as fallback
-        sidebarCollapsed: false,
-        editUrl:
-          'https://github.com/Soroban-Pulse/SorobanPulse/edit/main/docs/',
+        redirects: [
+          { from: '/docs/property-testing', to: '/docs/property-based-testing' },
+          { from: '/docs/api-contract-testing', to: '/docs/contract-testing' },
+        ],
+      },
+    ],
+  ],
+
+  // Offline full-text search, indexed at build time (no external service).
+  themes: [
+    '@docusaurus/theme-mermaid',
+    [
+      require.resolve('@easyops-cn/docusaurus-search-local'),
+      {
+        hashed: true,
+        indexBlog: false,
+        docsRouteBasePath: '/docs',
+        docsDir: '../../docs',
+        highlightSearchTermsOnTargetPage: true,
       },
     ],
   ],
@@ -53,9 +66,14 @@ const config = {
       ({
         docs: {
           // The primary "Getting Started" section uses the default docs plugin
+          // Single docs instance over the whole docs/ tree; every sidebar is
+          // built from docs/site/SUMMARY.md.
           path: '../../docs',
           routeBasePath: 'docs',
-          sidebarPath: require.resolve('./sidebars/getting-started.js'),
+          sidebarPath: require.resolve('./sidebars.js'),
+          exclude: ['site/**', '**/node_modules/**'],
+          // Keep ADR numbers (adr/0001-…) in doc IDs and URLs.
+          numberPrefixParser: false,
           editUrl:
             'https://github.com/Soroban-Pulse/SorobanPulse/edit/main/docs/',
           showLastUpdateAuthor: true,
@@ -82,8 +100,10 @@ const config = {
   // ---------------------------------------------------------------------------
   markdown: {
     mermaid: true,
+    // Parse .md files as CommonMark and only .mdx files as MDX, so plain
+    // Markdown docs with `<` or `{` in prose do not break the build.
+    format: 'detect',
   },
-  themes: ['@docusaurus/theme-mermaid'],
 
   // ---------------------------------------------------------------------------
   // Theme configuration
@@ -128,137 +148,23 @@ const config = {
         style: 'dark',
         hideOnScroll: false,
         items: [
-          // ── Section 1: Getting Started ──────────────────────────────
-          {
-            type: 'doc',
-            docId: 'onboarding',
-            position: 'left',
-            label: 'Getting Started',
-          },
-          // ── Section 2: Guides ───────────────────────────────────────
+          // One entry per top-level section of docs/site/SUMMARY.md.
+          { type: 'docSidebar', sidebarId: 'getting-started', position: 'left', label: 'Getting Started' },
+          { type: 'docSidebar', sidebarId: 'guides', position: 'left', label: 'Guides' },
           {
             type: 'dropdown',
-            label: 'Guides',
+            label: 'API',
             position: 'left',
             items: [
-              {
-                label: 'API Usage',
-                to: '/guides/api-guide',
-              },
-              {
-                label: 'SDK Integration',
-                to: '/guides/sdk-integration-guide',
-              },
-              {
-                label: 'Webhooks',
-                to: '/guides/webhook-verification',
-              },
-              {
-                label: 'Subscriptions',
-                to: '/guides/subscription-best-practices',
-              },
-              {
-                label: 'Contract Events',
-                to: '/guides/contract-event-schemas',
-              },
-              {
-                label: 'Streaming (SSE)',
-                to: '/guides/sse-reconnection',
-              },
+              { type: 'docSidebar', sidebarId: 'api', label: 'API Guides' },
+              { label: 'Interactive API Reference', to: '/api-reference' },
+              { label: 'OpenAPI JSON', href: 'pathname:///openapi.json' },
             ],
           },
-          // ── Section 3: API Reference ─────────────────────────────────
-          {
-            type: 'dropdown',
-            label: 'API Reference',
-            position: 'left',
-            items: [
-              {
-                label: 'Interactive API Reference',
-                to: '/api-reference',
-              },
-              {
-                label: 'Interactive Docs (Swagger)',
-                href: '/docs',
-              },
-              {
-                label: 'OpenAPI JSON',
-                href: '/openapi.json',
-              },
-              {
-                label: 'API Versioning',
-                to: '/guides/api-versioning',
-              },
-              {
-                label: 'API Changelog',
-                to: '/guides/api-changelog',
-              },
-              {
-                label: 'Rate Limiting',
-                to: '/guides/rate_limiting',
-              },
-            ],
-          },
-          // ── Section 4: Operations ────────────────────────────────────
-          {
-            type: 'dropdown',
-            label: 'Operations',
-            position: 'left',
-            items: [
-              {
-                label: 'Deployment',
-                to: '/guides/deployment',
-              },
-              {
-                label: 'Architecture',
-                to: '/guides/architecture',
-              },
-              {
-                label: 'Metrics Reference',
-                to: '/guides/metrics-reference',
-              },
-              {
-                label: 'Alerting',
-                to: '/guides/alerting',
-              },
-              {
-                label: 'Troubleshooting',
-                to: '/guides/troubleshooting-guide',
-              },
-              {
-                label: 'Runbooks',
-                to: '/guides/runbooks/operator-runbook',
-              },
-            ],
-          },
-          // ── Section 5: Contributing ──────────────────────────────────
-          {
-            type: 'dropdown',
-            label: 'Contributing',
-            position: 'left',
-            items: [
-              {
-                label: 'CONTRIBUTING.md',
-                href: 'https://github.com/Soroban-Pulse/SorobanPulse/blob/main/CONTRIBUTING.md',
-              },
-              {
-                label: 'Development Setup',
-                to: '/guides/development-setup',
-              },
-              {
-                label: 'Architecture Decisions (ADRs)',
-                to: '/guides/adr/README',
-              },
-              {
-                label: 'Design Tokens',
-                to: '/guides/design-tokens',
-              },
-              {
-                label: 'Diagram Style Guide',
-                to: '/guides/diagram-style-guide',
-              },
-            ],
-          },
+          { type: 'docSidebar', sidebarId: 'operations', position: 'left', label: 'Operations' },
+          { type: 'docSidebar', sidebarId: 'integrations', position: 'left', label: 'Integrations' },
+          { type: 'docSidebar', sidebarId: 'contributing', position: 'left', label: 'Contributing' },
+          { type: 'docSidebar', sidebarId: 'reference', position: 'left', label: 'Reference' },
           // ── Right-side items ─────────────────────────────────────────
           {
             href: 'https://github.com/Soroban-Pulse/SorobanPulse',
@@ -283,28 +189,27 @@ const config = {
             title: 'Docs',
             items: [
               { label: 'Getting Started', to: '/docs/onboarding' },
-              { label: 'API Guide', to: '/guides/api-guide' },
-              { label: 'SDK Integration', to: '/guides/sdk-integration-guide' },
-              { label: 'FAQ', to: '/guides/FAQ' },
+              { label: 'API Guide', to: '/docs/api-guide' },
+              { label: 'SDK Integration', to: '/docs/sdk-integration-guide' },
+              { label: 'FAQ', to: '/docs/FAQ' },
             ],
           },
           {
             title: 'API',
             items: [
               { label: 'API Reference', to: '/api-reference' },
-              { label: 'Swagger UI', href: '/docs' },
-              { label: 'OpenAPI JSON', href: '/openapi.json' },
-              { label: 'API Changelog', to: '/guides/api-changelog' },
-              { label: 'API Versioning', to: '/guides/api-versioning' },
+              { label: 'OpenAPI JSON', href: 'pathname:///openapi.json' },
+              { label: 'API Changelog', to: '/docs/api-changelog' },
+              { label: 'API Versioning', to: '/docs/api-versioning' },
             ],
           },
           {
             title: 'Operations',
             items: [
-              { label: 'Deployment', to: '/guides/deployment' },
-              { label: 'Metrics', to: '/guides/metrics-reference' },
-              { label: 'Alerts', to: '/guides/alerting' },
-              { label: 'Runbooks', to: '/guides/runbooks/operator-runbook' },
+              { label: 'Deployment', to: '/docs/deployment' },
+              { label: 'Metrics', to: '/docs/metrics-reference' },
+              { label: 'Alerts', to: '/docs/alerting' },
+              { label: 'Runbooks', to: '/docs/runbooks/operator-runbook' },
             ],
           },
           {

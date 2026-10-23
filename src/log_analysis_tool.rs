@@ -211,7 +211,7 @@ pub fn suggest_root_causes(
             confidence,
         });
     }
-    suggestions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+    suggestions.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
     suggestions
 }
 

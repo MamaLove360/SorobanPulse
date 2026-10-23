@@ -1,6 +1,6 @@
 # Log Aggregation Setup
 
-Soroban Pulse emits structured JSON logs when `RUST_LOG_FORMAT=json`. This document covers integration with ELK Stack, Datadog, and AWS CloudWatch.
+Soroban Pulse emits structured JSON logs when `RUST_LOG_FORMAT=json`. This document covers integration with Loki/Grafana, ELK Stack, Datadog, and AWS CloudWatch.
 
 ## Enabling JSON Logs
 
@@ -20,6 +20,124 @@ Example log line:
   "target": "soroban_pulse::indexer"
 }
 ```
+
+---
+
+## Loki + Grafana Integration
+
+The repository ships a ready-to-use Loki stack in `docker-compose.observability.yml`
+(Loki + Promtail + Grafana with provisioned datasources and dashboards).
+
+### Starting the Full Stack
+
+```bash
+# Start the application together with Loki, Promtail and Grafana
+docker-compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+
+# Follow logs of the observability services
+docker-compose -f docker-compose.yml -f docker-compose.observability.yml logs -f loki promtail grafana
+```
+
+Make sure the application emits JSON logs so Promtail can parse them:
+
+```yaml
+# docker-compose.yml (soroban-pulse service)
+environment:
+  - RUST_LOG_FORMAT=json
+  - RUST_LOG=info
+```
+
+Services exposed by the observability overlay:
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| `loki` | `3100` | Log storage / query API |
+| `promtail` | `9080` | Log shipper (scrapes container logs) |
+| `grafana` | `3000` | Dashboards and Explore UI |
+
+### How Promtail Scrapes the Application
+
+Promtail runs with access to the Docker container log directory and the Docker
+socket, so it discovers the `soroban-pulse` container and tails its stdout/stderr:
+
+```yaml
+# promtail/config.yml (excerpt)
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            message: message
+            target: target
+            contract_id: contract_id
+            ledger: ledger
+            correlation_id: correlation_id
+      - labels:
+          level:
+          target:
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+```
+
+Each log line is stored in Loki with the labels `container`, `service`,
+`level` and `target`, while the remaining JSON fields stay in the log body.
+
+### Querying Logs in Grafana Explore
+
+1. Open Grafana at <http://localhost:3000> (default credentials `admin` / `admin`).
+2. Go to **Explore** and select the **Loki** datasource
+   (provisioned from `docs/grafana/provisioning/datasources/loki.yml`).
+3. Use LogQL queries such as:
+
+```logql
+# All logs from the application container
+{container="soroban-pulse"}
+
+# Only errors
+{container="soroban-pulse", level="ERROR"}
+
+# Filter by contract
+{container="soroban-pulse"} | json | contract_id="CABC...XYZ"
+
+# Ledger range
+{container="soroban-pulse"} | json | ledger >= 50000 and ledger <= 60000
+
+# Error rate over time
+sum(count_over_time({container="soroban-pulse", level="ERROR"} [5m]))
+```
+
+### Logs Panel on the Grafana Dashboard
+
+The provisioned dashboard (`docs/grafana/provisioning/dashboards/`) includes a
+**Logs** panel backed by the Loki datasource. It shows the most recent
+application logs and supports filtering by `level` and `contract_id` via the
+dashboard variables. To add your own panel:
+
+1. **Add** → **Visualization** → choose **Logs**.
+2. Select the **Loki** datasource.
+3. Enter a query, e.g. `{container="soroban-pulse"} |= ""`.
+4. Save the dashboard.
 
 ---
 

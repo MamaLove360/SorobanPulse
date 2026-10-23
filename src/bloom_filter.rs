@@ -38,7 +38,19 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashSet;
 
+use crate::error::InitError;
 use crate::metrics;
+
+/// Build a bloom filter, mapping the crate's parameter-validation error
+/// (zero capacity, fp_rate outside (0, 1)) to a typed [`InitError`].
+fn new_bloom(capacity: usize, fp_rate: f64) -> Result<Bloom<String>, InitError> {
+    Bloom::new_for_fp_rate(capacity, fp_rate).map_err(|reason| {
+        InitError::invalid_config(
+            "bloom filter",
+            format!("capacity={capacity}, fp_rate={fp_rate}: {reason}"),
+        )
+    })
+}
 
 // ── Issue #615: Session-level Bloom filter ───────────────────────────────────
 
@@ -57,15 +69,14 @@ pub struct SessionBloomFilter {
 
 impl SessionBloomFilter {
     /// Create a session filter sized for `capacity` events per ledger.
-    pub fn new(capacity: usize, fp_rate: f64) -> Self {
-        let bloom = Bloom::new_for_fp_rate(capacity, fp_rate)
-            .expect("Failed to create session bloom filter");
-        Self {
+    pub fn new(capacity: usize, fp_rate: f64) -> Result<Self, InitError> {
+        let bloom = new_bloom(capacity, fp_rate)?;
+        Ok(Self {
             inner: Mutex::new(bloom),
             current_ledger: Mutex::new(0),
             capacity,
             fp_rate,
-        }
+        })
     }
 
     /// Check whether this event was already seen in the current session.
@@ -75,17 +86,25 @@ impl SessionBloomFilter {
     pub fn check_and_set(&self, tx_hash: &str, contract_id: &str, event_type: &str, ledger: u64) -> bool {
         let key = format!("{tx_hash}:{contract_id}:{event_type}");
 
-        let mut current = self.current_ledger.lock().expect("session bloom ledger lock poisoned");
+        let mut current = self.current_ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if ledger > *current {
-            // New ledger detected — reset the filter.
-            let new_bloom = Bloom::new_for_fp_rate(self.capacity, self.fp_rate)
-                .expect("Failed to recreate session bloom filter");
-            *self.inner.lock().expect("session bloom inner lock poisoned") = new_bloom;
+            // New ledger detected — reset the filter. The parameters were
+            // validated in `new`, so a rebuild failure is not expected; if it
+            // happens, clear the existing filter in place instead.
+            let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match new_bloom(self.capacity, self.fp_rate) {
+                Ok(fresh) => *guard = fresh,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to rebuild session bloom filter; clearing in place");
+                    guard.clear();
+                }
+            }
+            drop(guard);
             *current = ledger;
             metrics::record_session_bloom_reset();
         }
 
-        let mut guard = self.inner.lock().expect("session bloom inner lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.check(&key) {
             metrics::record_session_bloom_hit();
             return true;
@@ -123,9 +142,9 @@ pub struct EventBloomFilter {
 impl EventBloomFilter {
     /// Create a new bloom filter with the given false-positive rate and capacity.
     ///
-    /// # Panics
-    /// Panics if `fp_rate` is not in (0, 1) or `capacity` is 0.
-    pub fn new(capacity: usize, fp_rate: f64) -> Self {
+    /// Returns [`InitError::InvalidConfig`] if `fp_rate` is not in (0, 1) or
+    /// `capacity` is 0.
+    pub fn new(capacity: usize, fp_rate: f64) -> Result<Self, InitError> {
         Self::with_fill_threshold(capacity, fp_rate, 0.80)
     }
 
@@ -136,15 +155,17 @@ impl EventBloomFilter {
     /// fresh filter is created.  Set to `1.0` to disable rotation.
     ///
     /// Issue #996.
-    pub fn with_fill_threshold(capacity: usize, fp_rate: f64, fill_ratio_threshold: f64) -> Self {
-        let bloom = Bloom::new_for_fp_rate(capacity, fp_rate)
-            .expect("Failed to create bloom filter: invalid capacity or fp_rate");
-        let contract_bloom = Bloom::new_for_fp_rate(capacity / 10, fp_rate)
-            .expect("Failed to create contract bloom filter");
+    pub fn with_fill_threshold(
+        capacity: usize,
+        fp_rate: f64,
+        fill_ratio_threshold: f64,
+    ) -> Result<Self, InitError> {
+        let bloom = new_bloom(capacity, fp_rate)?;
+        let contract_bloom = new_bloom((capacity / 10).max(1), fp_rate)?;
         let memory_bytes = Self::estimate_memory_bytes(capacity, fp_rate);
         metrics::update_bloom_filter_memory_bytes(memory_bytes);
         metrics::update_bloom_filter_fill_ratio(0.0);
-        Self {
+        Ok(Self {
             inner: Mutex::new(bloom),
             previous: Mutex::new(None),
             capacity,
@@ -154,7 +175,7 @@ impl EventBloomFilter {
             rotation_count: AtomicU64::new(0),
             contract_filter: Mutex::new(contract_bloom),
             known_contracts: Mutex::new(HashSet::new()),
-        }
+        })
     }
 
     /// Build the deduplication key for an event.
@@ -188,13 +209,20 @@ impl EventBloomFilter {
         }
 
         // Rotation: swap inner into previous and create a fresh inner.
-        let new_bloom = Bloom::new_for_fp_rate(self.capacity, self.fp_rate)
-            .expect("Failed to create bloom filter during rotation");
+        // Parameters were validated at construction; if a rebuild still fails,
+        // skip this rotation and keep using the current filter.
+        let new_bloom = match new_bloom(self.capacity, self.fp_rate) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "Bloom filter rotation skipped");
+                return false;
+            }
+        };
         let old_inner = {
-            let mut guard = self.inner.lock().expect("bloom filter inner lock poisoned");
+            let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::replace(&mut *guard, new_bloom)
         };
-        *self.previous.lock().expect("bloom filter previous lock poisoned") = Some(old_inner);
+        *self.previous.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(old_inner);
         self.insert_count.store(0, Ordering::Relaxed);
         self.rotation_count.fetch_add(1, Ordering::Relaxed);
 
@@ -217,14 +245,14 @@ impl EventBloomFilter {
         let hit_current = self
             .inner
             .lock()
-            .expect("bloom filter lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .check(&k);
 
         // Check previous filter (may exist after a rotation).
         let hit_previous = if !hit_current {
             self.previous
                 .lock()
-                .expect("bloom filter previous lock poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .map(|b| b.check(&k))
                 .unwrap_or(false)
@@ -246,7 +274,7 @@ impl EventBloomFilter {
         let k = Self::key(tx_hash, contract_id, event_type);
         self.inner
             .lock()
-            .expect("bloom filter lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set(&k);
         let new_count = self.insert_count.fetch_add(1, Ordering::Relaxed) + 1;
         let fill_ratio = new_count as f64 / self.capacity as f64;
@@ -259,9 +287,9 @@ impl EventBloomFilter {
     ///
     /// Issue #996: seeding counts toward the rotation threshold.
     pub fn seed(&self, entries: impl IntoIterator<Item = (String, String, String)>) {
-        let mut guard = self.inner.lock().expect("bloom filter lock poisoned");
-        let mut contract_guard = self.contract_filter.lock().expect("contract filter lock poisoned");
-        let mut known_contracts = self.known_contracts.lock().expect("known_contracts lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut contract_guard = self.contract_filter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut known_contracts = self.known_contracts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut count = 0u64;
 
         for (tx_hash, contract_id, event_type) in entries {
@@ -305,7 +333,7 @@ impl EventBloomFilter {
         let has_previous = self
             .previous
             .lock()
-            .expect("bloom filter previous lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
         if has_previous { single * 2 } else { single }
     }
@@ -355,6 +383,14 @@ pub async fn seed_from_db(
 
     let count = rows.len();
     filter.seed(rows.into_iter().map(|(tx, cid, et)| (tx, cid, et)));
+    
+    // Estimate and record the current false-positive rate
+    let fill_ratio = filter.fill_ratio();
+    if fill_ratio > 0.0 {
+        let estimated_fp_rate = estimate_false_positive_rate(filter.fp_rate, fill_ratio);
+        metrics::set_bloom_false_positive_rate(estimated_fp_rate);
+    }
+    
     Ok(count)
 }
 
@@ -363,7 +399,7 @@ pub async fn persist_state(
     filter: &EventBloomFilter,
     pool: &sqlx::PgPool,
 ) -> Result<(), sqlx::Error> {
-    let guard = filter.inner.lock().expect("bloom filter lock poisoned");
+    let guard = filter.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let bitmap = guard.bitmap();
     let bitmap_bytes = bitmap.iter().map(|&b| b as i16).collect::<Vec<_>>();
     let now = SystemTime::now()
@@ -386,6 +422,51 @@ pub async fn persist_state(
     Ok(())
 }
 
+/// Calculate auto-sized bloom filter parameters from expected daily event count and target FP rate.
+/// Returns (capacity, fp_rate) suitable for EventBloomFilter::with_fill_threshold.
+///
+/// For high-volume deployments (>10,000 events/day), auto-sizing ensures the filter doesn't
+/// degrade under load. At 10x capacity, the FP rate should remain under the configured target.
+pub fn auto_size_bloom_filter(
+    expected_items_per_day: usize,
+    target_fp_rate: f64,
+) -> (usize, f64) {
+    if expected_items_per_day == 0 {
+        return (1_000_000, 0.001);
+    }
+
+    // Use 10× the daily rate as capacity to account for variable workloads and avoid
+    // frequent rotations. At 10x, the actual FP rate should still be near the target.
+    let capacity = expected_items_per_day * 10;
+
+    // Clamp the target FP rate to reasonable bounds [0.0001, 0.01]
+    let clamped_fp_rate = target_fp_rate.clamp(0.0001, 0.01);
+
+    (capacity, clamped_fp_rate)
+}
+
+/// Estimate the actual false-positive rate of a bloom filter at a given fill ratio.
+///
+/// Uses the approximation: FP_rate_actual ≈ target_FP_rate * (fill_ratio ^ k_hash_functions)
+/// where k is derived from the target FP rate. This is an approximation used for monitoring.
+pub fn estimate_false_positive_rate(target_fp_rate: f64, fill_ratio: f64) -> f64 {
+    if fill_ratio <= 0.0 || fill_ratio >= 1.0 || target_fp_rate <= 0.0 || target_fp_rate >= 1.0 {
+        return target_fp_rate;
+    }
+
+    // Derive approximate k (number of hash functions) from target FP rate.
+    // k = ln(2) * m / n = ln(2) / -ln(target_FP_rate)
+    let k = std::f64::consts::LN_2 / (-target_fp_rate.ln());
+
+    // Approximate actual FP rate at current fill ratio.
+    // As fill ratio increases, FP rate approaches target asymptotically.
+    // Using: FP_actual ≈ target * (fill_ratio ^ k)
+    let estimated = target_fp_rate * fill_ratio.powf(k);
+
+    // Clamp to [0, 1] and never lower than target (can only degrade, not improve)
+    estimated.clamp(target_fp_rate, 1.0)
+}
+
 /// Restore the bloom filter state from the database if available and not stale.
 pub async fn restore_state(
     pool: &sqlx::PgPool,
@@ -406,18 +487,22 @@ pub async fn restore_state(
 
     match row {
         Some((capacity, fp_rate, bitmap_bytes)) => {
-            let bloom = Bloom::new_for_fp_rate(capacity as usize, fp_rate)
-                .expect("Failed to create bloom filter from persisted state");
-
             // Bitmap restoration is deferred to DB re-seeding; the persisted state
             // is used only to restore capacity/fp_rate parameters.
             let _ = &bitmap_bytes;
 
-            let contract_bloom = Bloom::new_for_fp_rate(
-                (capacity as usize).max(100) / 10,
-                fp_rate,
-            )
-            .expect("Failed to create contract bloom from persisted state");
+            // Corrupt persisted parameters are treated as "no usable state" so
+            // the caller falls back to a freshly seeded filter.
+            let (bloom, contract_bloom) = match (
+                new_bloom(capacity as usize, fp_rate),
+                new_bloom((capacity as usize).max(100) / 10, fp_rate),
+            ) {
+                (Ok(b), Ok(c)) => (b, c),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!(error = %e, "Ignoring persisted bloom filter state");
+                    return Ok(None);
+                }
+            };
             Ok(Some(EventBloomFilter {
                 inner: Mutex::new(bloom),
                 previous: Mutex::new(None),
@@ -439,7 +524,7 @@ mod tests {
     use super::*;
 
     fn make_filter() -> EventBloomFilter {
-        EventBloomFilter::new(10_000, 0.001)
+        EventBloomFilter::new(10_000, 0.001).unwrap()
     }
 
     #[test]
@@ -494,7 +579,7 @@ mod tests {
 
     #[test]
     fn filter_stores_capacity_and_fp_rate() {
-        let f = EventBloomFilter::new(5000, 0.01);
+        let f = EventBloomFilter::new(5000, 0.01).unwrap();
         assert_eq!(f.capacity, 5000);
         assert_eq!(f.fp_rate, 0.01);
     }
@@ -503,14 +588,14 @@ mod tests {
 
     #[test]
     fn fill_ratio_zero_on_new_filter() {
-        let f = EventBloomFilter::new(10_000, 0.001);
+        let f = EventBloomFilter::new(10_000, 0.001).unwrap();
         assert_eq!(f.fill_ratio(), 0.0);
         assert_eq!(f.rotation_count(), 0);
     }
 
     #[test]
     fn fill_ratio_increases_with_inserts() {
-        let f = EventBloomFilter::new(1000, 0.001);
+        let f = EventBloomFilter::new(1000, 0.001).unwrap();
         f.set("tx1", "c1", "contract");
         assert!(f.fill_ratio() > 0.0);
     }
@@ -518,7 +603,7 @@ mod tests {
     #[test]
     fn rotation_triggered_when_fill_threshold_exceeded() {
         // Small capacity so we hit the threshold quickly.
-        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5);
+        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5).unwrap();
         for i in 0..6u32 {
             f.set(&format!("tx{i}"), "c1", "contract");
         }
@@ -527,7 +612,7 @@ mod tests {
 
     #[test]
     fn entries_still_found_after_rotation() {
-        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5);
+        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5).unwrap();
         f.set("tx_before_rotate", "c1", "contract");
         for i in 0..6u32 {
             f.set(&format!("tx{i}"), "c1", "contract");
@@ -537,7 +622,7 @@ mod tests {
 
     #[test]
     fn fill_ratio_resets_after_rotation() {
-        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5);
+        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5).unwrap();
         for i in 0..8u32 {
             f.set(&format!("tx{i}"), "c1", "contract");
         }
@@ -547,7 +632,7 @@ mod tests {
 
     #[test]
     fn memory_bytes_positive() {
-        let f = EventBloomFilter::new(10_000, 0.001);
+        let f = EventBloomFilter::new(10_000, 0.001).unwrap();
         assert!(f.memory_bytes() > 0);
     }
 
@@ -569,14 +654,14 @@ mod tests {
 
     #[test]
     fn fill_ratio_zero_on_new_filter() {
-        let f = EventBloomFilter::new(10_000, 0.001);
+        let f = EventBloomFilter::new(10_000, 0.001).unwrap();
         assert_eq!(f.fill_ratio(), 0.0);
         assert_eq!(f.rotation_count(), 0);
     }
 
     #[test]
     fn fill_ratio_increases_with_inserts() {
-        let f = EventBloomFilter::new(1000, 0.001);
+        let f = EventBloomFilter::new(1000, 0.001).unwrap();
         f.set("tx1", "c1", "contract");
         assert!(f.fill_ratio() > 0.0);
     }
@@ -584,7 +669,7 @@ mod tests {
     #[test]
     fn rotation_triggered_when_fill_threshold_exceeded() {
         // Use a very small capacity so we hit the threshold quickly.
-        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5);
+        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5).unwrap();
         // Insert 6 items (> 50% of 10) to trigger rotation.
         for i in 0..6u32 {
             f.set(&format!("tx{i}"), "c1", "contract");
@@ -595,7 +680,7 @@ mod tests {
     #[test]
     fn entries_still_found_after_rotation() {
         // After rotation the previous filter should still answer `check` positively.
-        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5);
+        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5).unwrap();
         f.set("tx_before_rotate", "c1", "contract");
         // Force a rotation by filling past threshold.
         for i in 0..6u32 {
@@ -607,7 +692,7 @@ mod tests {
 
     #[test]
     fn fill_ratio_resets_after_rotation() {
-        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5);
+        let f = EventBloomFilter::with_fill_threshold(10, 0.01, 0.5).unwrap();
         for i in 0..8u32 {
             f.set(&format!("tx{i}"), "c1", "contract");
         }
@@ -618,7 +703,7 @@ mod tests {
 
     #[test]
     fn memory_bytes_positive() {
-        let f = EventBloomFilter::new(10_000, 0.001);
+        let f = EventBloomFilter::new(10_000, 0.001).unwrap();
         assert!(f.memory_bytes() > 0);
     }
 
@@ -639,7 +724,7 @@ mod tests {
     // ── Issue #615: SessionBloomFilter tests ─────────────────────────────────
 
     fn make_session_filter() -> SessionBloomFilter {
-        SessionBloomFilter::new(10_000, 0.001)
+        SessionBloomFilter::new(10_000, 0.001).unwrap()
     }
 
     #[test]
@@ -687,5 +772,58 @@ mod tests {
         let second = f2.check_and_set("txA", "cA", "contract", 50);
         assert!(!first);
         assert!(second);
+    }
+
+    // ── Auto-sizing tests ────────────────────────────────────────────────
+
+    #[test]
+    fn auto_size_zero_items_returns_defaults() {
+        let (cap, fp) = auto_size_bloom_filter(0, 0.001);
+        assert_eq!(cap, 1_000_000);
+        assert_eq!(fp, 0.001);
+    }
+
+    #[test]
+    fn auto_size_scales_capacity_by_10x() {
+        let (cap, _fp) = auto_size_bloom_filter(10_000, 0.001);
+        assert_eq!(cap, 100_000);
+    }
+
+    #[test]
+    fn auto_size_high_daily_volume() {
+        let (cap, fp) = auto_size_bloom_filter(100_000, 0.001);
+        assert_eq!(cap, 1_000_000);
+        assert_eq!(fp, 0.001);
+    }
+
+    #[test]
+    fn auto_size_clamps_fp_rate() {
+        let (_, fp_low) = auto_size_bloom_filter(10_000, 0.00001);
+        assert_eq!(fp_low, 0.0001); // clamped to min
+
+        let (_, fp_high) = auto_size_bloom_filter(10_000, 0.1);
+        assert_eq!(fp_high, 0.01); // clamped to max
+    }
+
+    #[test]
+    fn estimate_fp_rate_at_zero_fill_ratio_returns_target() {
+        let est = estimate_false_positive_rate(0.001, 0.0);
+        assert_eq!(est, 0.001);
+    }
+
+    #[test]
+    fn estimate_fp_rate_at_full_capacity_higher_than_target() {
+        let est = estimate_false_positive_rate(0.001, 1.0);
+        assert!(est >= 0.001);
+        assert!(est <= 1.0);
+    }
+
+    #[test]
+    fn estimate_fp_rate_at_half_fill_shows_degradation() {
+        let target = 0.001;
+        let est_half = estimate_false_positive_rate(target, 0.5);
+        let est_full = estimate_false_positive_rate(target, 1.0);
+        // At half fill, FP rate should be better than at full
+        assert!(est_half < est_full);
     }
 }

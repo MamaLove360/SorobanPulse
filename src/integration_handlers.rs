@@ -17,6 +17,73 @@ use crate::{
     slack::SlackOAuthConfig,
 };
 
+/// Validate a user-supplied callback / redirect URL against the
+/// `ALLOWED_CALLBACK_DOMAINS` allowlist (Issue #1271).
+///
+/// The URL must be absolute, use `http` or `https`, and its host must match
+/// one of the configured domains. Matching is case-insensitive and also
+/// accepts subdomains of an allowed domain (e.g. `app.example.com` matches
+/// `example.com`).
+///
+/// Returns `Ok(())` when the URL is allowed, or an `Err` carrying a
+/// `400 Bad Request` status and a clear message otherwise.
+pub fn validate_callback_url(url: &str) -> Result<(), (StatusCode, String)> {
+    let parsed = url::Url::parse(url).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid callback URL: must be an absolute URL".to_string(),
+        )
+    })?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid callback URL: scheme must be http or https".to_string(),
+            ));
+        }
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid callback URL: missing host".to_string(),
+        )
+    })?;
+    let host = host.to_ascii_lowercase();
+
+    let allowed: Vec<String> = std::env::var("ALLOWED_CALLBACK_DOMAINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if allowed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Callback URL rejected: no allowed callback domains are configured".to_string(),
+        ));
+    }
+
+    let is_allowed = allowed.iter().any(|domain| {
+        let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+        !domain.is_empty() && (host == domain || host.ends_with(&format!(".{}", domain)))
+    });
+
+    if is_allowed {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Callback URL rejected: domain '{}' is not in the allowed callback domains list",
+                host
+            ),
+        ))
+    }
+}
+
 /// Map a credential encryption failure to an HTTP error (Issue #1162).
 /// Never includes the credential itself.
 fn secret_error(e: SecretError) -> (StatusCode, String) {
@@ -41,6 +108,8 @@ pub struct GitHubIntegrationRequest {
     pub issue_body_template: Option<String>,
     pub auto_create_issues: Option<bool>,
     pub pr_comment_enabled: Option<bool>,
+    /// OAuth callback / redirect URL supplied by the user (validated).
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,6 +129,8 @@ pub struct SlackIntegrationRequest {
     pub block_kit_enabled: Option<bool>,
     pub thread_support: Option<bool>,
     pub user_mentions_enabled: Option<bool>,
+    /// OAuth callback / redirect URL supplied by the user (validated).
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,6 +141,8 @@ pub struct TelegramIntegrationRequest {
     pub webhook_url: Option<String>,
     pub message_thread_support: Option<bool>,
     pub button_support: Option<bool>,
+    /// OAuth callback / redirect URL supplied by the user (validated).
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,6 +172,10 @@ pub async fn setup_github_integration(
     Path(subscription_id): Path<Uuid>,
     Json(req): Json<GitHubIntegrationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(callback_url) = req.callback_url.as_deref() {
+        validate_callback_url(callback_url)?;
+    }
+
     let id = Uuid::new_v4();
     let access_token = integration_secrets::seal(&req.access_token).map_err(secret_error)?;
 
@@ -230,6 +307,10 @@ pub async fn setup_slack_integration(
     Path(subscription_id): Path<Uuid>,
     Json(req): Json<SlackIntegrationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(callback_url) = req.callback_url.as_deref() {
+        validate_callback_url(callback_url)?;
+    }
+
     let id = Uuid::new_v4();
     let webhook_url = integration_secrets::seal_opt(req.webhook_url.as_deref()).map_err(secret_error)?;
     let bot_token = integration_secrets::seal_opt(req.bot_token.as_deref()).map_err(secret_error)?;
@@ -296,6 +377,13 @@ pub async fn setup_telegram_integration(
     Path(subscription_id): Path<Uuid>,
     Json(req): Json<TelegramIntegrationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(callback_url) = req.callback_url.as_deref() {
+        validate_callback_url(callback_url)?;
+    }
+    if let Some(webhook_url) = req.webhook_url.as_deref() {
+        validate_callback_url(webhook_url)?;
+    }
+
     let id = Uuid::new_v4();
     let bot_token = integration_secrets::seal(&req.bot_token).map_err(secret_error)?;
 
@@ -817,7 +905,10 @@ pub async fn acknowledge_pagerduty_incident(
 
     let mut config = crate::pagerduty::PagerDutyConfig::default();
     config.routing_key = integration_secrets::open(&routing_key).map_err(secret_error)?;
-    let client = crate::pagerduty::PagerDutyClient::new(config);
+    let client = crate::pagerduty::PagerDutyClient::new(config).map_err(|e| {
+        error!(error = %e, "Failed to build PagerDuty client");
+        (StatusCode::INTERNAL_SERVER_ERROR, "PagerDuty client unavailable".to_string())
+    })?;
 
     client
         .acknowledge_incident(
@@ -872,7 +963,10 @@ pub async fn resolve_pagerduty_incident(
 
     let mut config = crate::pagerduty::PagerDutyConfig::default();
     config.routing_key = integration_secrets::open(&routing_key).map_err(secret_error)?;
-    let client = crate::pagerduty::PagerDutyClient::new(config);
+    let client = crate::pagerduty::PagerDutyClient::new(config).map_err(|e| {
+        error!(error = %e, "Failed to build PagerDuty client");
+        (StatusCode::INTERNAL_SERVER_ERROR, "PagerDuty client unavailable".to_string())
+    })?;
 
     client
         .resolve_incident(&req.dedup_key, Some(&pool))
@@ -950,4 +1044,64 @@ pub async fn list_pagerduty_incidents(
         .collect();
 
     Ok((StatusCode::OK, Json(json!({ "incidents": items }))))
+}
+
+#[cfg(test)]
+mod callback_url_tests {
+    use super::validate_callback_url;
+    use axum::http::StatusCode;
+
+    fn set_allowed(domains: &str) {
+        std::env::set_var("ALLOWED_CALLBACK_DOMAINS", domains);
+    }
+
+    #[test]
+    fn allows_exact_domain() {
+        set_allowed("example.com");
+        assert!(validate_callback_url("https://example.com/oauth/callback").is_ok());
+    }
+
+    #[test]
+    fn allows_subdomain() {
+        set_allowed("example.com");
+        assert!(validate_callback_url("https://app.example.com/cb").is_ok());
+    }
+
+    #[test]
+    fn allows_any_of_multiple_domains() {
+        set_allowed("example.com, foo.test");
+        assert!(validate_callback_url("https://foo.test/cb").is_ok());
+    }
+
+    #[test]
+    fn rejects_unlisted_domain() {
+        set_allowed("example.com");
+        let err = validate_callback_url("https://evil.test/cb").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("not in the allowed"));
+    }
+
+    #[test]
+    fn rejects_lookalike_domain() {
+        set_allowed("example.com");
+        assert!(validate_callback_url("https://notexample.com/cb").is_err());
+    }
+
+    #[test]
+    fn rejects_non_http_scheme() {
+        set_allowed("example.com");
+        assert!(validate_callback_url("ftp://example.com/cb").is_err());
+    }
+
+    #[test]
+    fn rejects_relative_url() {
+        set_allowed("example.com");
+        assert!(validate_callback_url("/oauth/callback").is_err());
+    }
+
+    #[test]
+    fn rejects_when_allowlist_empty() {
+        set_allowed("");
+        assert!(validate_callback_url("https://example.com/cb").is_err());
+    }
 }

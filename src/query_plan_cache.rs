@@ -472,48 +472,6 @@ fn parse_explain_output(json_str: &str, query: &str) -> Result<QueryPlan, sqlx::
     })
 }
 
-pub async fn create_pool_with_plan_cache(
-    database_url: &str,
-    db_max_connections: u32,
-    db_min_connections: u32,
-    db_statement_timeout_ms: u64,
-    db_idle_timeout_secs: u64,
-    db_max_lifetime_secs: u64,
-    db_test_before_acquire: bool,
-) -> Result<(PgPool, QueryPlanCache), sqlx::Error> {
-    use sqlx::postgres::PgPoolOptions;
-    use std::time::Duration;
-
-    info!(
-        min_connections = db_min_connections,
-        max_connections = db_max_connections,
-        statement_timeout_ms = db_statement_timeout_ms,
-        "Creating connection pool with plan cache"
-    );
-
-    let pool = PgPoolOptions::new()
-        .max_connections(db_max_connections)
-        .min_connections(db_min_connections)
-        .idle_timeout(Duration::from_secs(db_idle_timeout_secs))
-        .max_lifetime(Duration::from_secs(db_max_lifetime_secs))
-        .test_before_acquire(db_test_before_acquire)
-        .after_connect(move |conn, _| {
-            Box::pin(async move {
-                conn.execute(
-                    format!("SET statement_timeout = '{db_statement_timeout_ms}ms'").as_str(),
-                )
-                .await
-                .map(|_| ())
-            })
-        })
-        .connect(database_url)
-        .await?;
-
-    let cache = QueryPlanCache::with_defaults();
-
-    Ok((pool, cache))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

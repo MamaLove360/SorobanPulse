@@ -59,6 +59,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Every Markdown file under docs/ must be reachable from SUMMARY.md.
+      - name: Check every doc is in the navigation
+        run: npm run check-nav
+
       # Copy the canonical openapi.json into the static folder so the
       # API Reference page and Scalar embed can load it at /openapi.json.
       - name: Copy OpenAPI spec to static assets

@@ -13,6 +13,8 @@
 //! - Tenant map reuse across concurrent requests
 //! - Audit trail: TenantId extension availability for handlers
 //! - RLS / SQL layer: tenant_id filter correctness
+//! - RLS against a real PostgreSQL instance (Issue #1344): cross-tenant
+//!   reads/writes return 0 rows, superuser still reads every row
 
 use axum::{
     body::Body,
@@ -48,6 +50,8 @@ fn build_app(
         admin_api_keys,
         tenant_map: Arc::new(tenant_map),
         multi_tenant,
+        pool: None,
+        require_auth: false,
     });
 
     Router::new()
@@ -609,9 +613,9 @@ fn test_26_tenant_filter_sql_contains_correct_placeholder() {
 /// visible to all — verify the IS NULL logic in the RLS expression string.
 #[test]
 fn test_27_rls_policy_null_tenant_visible_to_all() {
-    // The RLS policy string from 20260527000001_rls_events.sql
+    // The RLS policy string from 20261022000001_rls_events_partitioned.sql
     let policy = "tenant_id IS NULL \
-                  OR current_setting('app.current_tenant_id', TRUE) = '' \
+                  OR COALESCE(current_setting('app.current_tenant_id', TRUE), '') = '' \
                   OR tenant_id = current_setting('app.current_tenant_id', TRUE)";
 
     // All three OR branches present
@@ -721,4 +725,353 @@ async fn test_30_revoked_key_rejected_even_if_in_tenant_map() {
     // Revoked key is rejected at the auth gate (not even a tenant lookup)
     let resp_revoked = get_response(app, Some(revoked_key)).await;
     assert_eq!(resp_revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. Row-level security against a real PostgreSQL instance (Issue #1344)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests need DATABASE_URL to point at a PostgreSQL server whose user is
+// a superuser (the default `postgres` user in CI and docker-compose.test.yml).
+// `#[sqlx::test]` creates a fresh database per test and runs every migration.
+//
+// Superusers and table owners bypass RLS, so each test creates a throwaway
+// NOSUPERUSER NOBYPASSRLS role and switches to it with SET LOCAL ROLE. This
+// mirrors a production deployment where the application connects as a
+// non-owner role.
+
+mod rls {
+    use sqlx::{PgPool, Postgres, Transaction};
+
+    const TENANT_A: &str = "tenant-a";
+    const TENANT_B: &str = "tenant-b";
+    /// Inside the 2026_01 monthly partition created by 20260727000102.
+    const EVENT_TS: &str = "2026-01-15T00:00:00Z";
+
+    /// Insert `count` events for `tenant` as the (superuser) pool owner.
+    async fn seed_events(pool: &PgPool, tenant: &str, count: i64) {
+        for i in 0..count {
+            sqlx::query(
+                "INSERT INTO events \
+                     (contract_id, event_type, tx_hash, ledger, timestamp, event_data, tenant_id) \
+                 VALUES ($1, 'contract', $2, $3, $4::timestamptz, '{\"topic\": [], \"value\": {}}'::jsonb, $5)",
+            )
+            .bind(format!("C{}", tenant.to_uppercase()))
+            .bind(format!("tx-{tenant}-{i}"))
+            .bind(1_000 + i)
+            .bind(EVENT_TS)
+            .bind(tenant)
+            .execute(pool)
+            .await
+            .expect("seed insert failed");
+        }
+    }
+
+    /// Seed both tenants: 3 rows for tenant A, 2 rows for tenant B.
+    async fn seed_two_tenants(pool: &PgPool) {
+        seed_events(pool, TENANT_A, 3).await;
+        seed_events(pool, TENANT_B, 2).await;
+    }
+
+    /// Create a non-superuser, non-BYPASSRLS application role with the given
+    /// privileges on `events`. Roles are cluster-wide, so the name is unique
+    /// per test to allow parallel execution.
+    async fn create_app_role(pool: &PgPool, privileges: &str) -> String {
+        let role = format!("rls_app_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"))
+            .execute(pool)
+            .await
+            .expect("create role failed");
+        sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO {role}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("GRANT {privileges} ON events TO {role}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        role
+    }
+
+    async fn drop_app_role(pool: &PgPool, role: &str) {
+        sqlx::query(&format!("DROP OWNED BY {role}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP ROLE {role}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Open a transaction acting as `role` and scoped to `tenant` (or
+    /// unscoped when `None`), exactly as the application would with
+    /// `SET LOCAL`.
+    async fn scoped_tx<'a>(
+        pool: &'a PgPool,
+        role: Option<&str>,
+        tenant: Option<&str>,
+    ) -> Transaction<'a, Postgres> {
+        let mut tx = pool.begin().await.unwrap();
+        if let Some(role) = role {
+            sqlx::query(&format!("SET LOCAL ROLE {role}"))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        if let Some(tenant) = tenant {
+            sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+                .bind(tenant)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx
+    }
+
+    async fn count_where(tx: &mut Transaction<'_, Postgres>, sql_where: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM events {sql_where}"))
+            .fetch_one(&mut **tx)
+            .await
+            .unwrap()
+    }
+
+    /// Test 31 — RLS is enabled on the live (partitioned) events table and on
+    /// every partition. Regression guard for the policy being stranded on
+    /// `events_legacy` after the partitioning rename.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_31_rls_enabled_on_partitioned_events_and_partitions(pool: PgPool) {
+        let (relkind, rls): (String, bool) = sqlx::query_as(
+            "SELECT relkind::text, relrowsecurity FROM pg_class WHERE oid = 'events'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(relkind, "p", "events should be the partitioned table");
+        assert!(rls, "RLS must be enabled on the partitioned events table");
+
+        let unprotected: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname::text FROM pg_inherits i \
+               JOIN pg_class c ON c.oid = i.inhrelid \
+              WHERE i.inhparent = 'events'::regclass \
+                AND (NOT c.relrowsecurity \
+                     OR NOT EXISTS (SELECT 1 FROM pg_policy p \
+                                     WHERE p.polrelid = c.oid AND p.polname = 'tenant_isolation'))",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(unprotected.is_empty(), "partitions without RLS: {unprotected:?}");
+    }
+
+    /// Test 32 — Two tenants, events for each: a session scoped to one tenant
+    /// sees only its own rows, and every cross-tenant query returns 0 rows.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_32_rls_cross_tenant_select_returns_zero_rows(pool: PgPool) {
+        seed_two_tenants(&pool).await;
+        let role = create_app_role(&pool, "SELECT").await;
+
+        {
+            let mut tx = scoped_tx(&pool, Some(&role), Some(TENANT_A)).await;
+            assert_eq!(count_where(&mut tx, "").await, 3, "tenant A sees only its own rows");
+            assert_eq!(
+                count_where(&mut tx, &format!("WHERE tenant_id = '{TENANT_B}'")).await,
+                0,
+                "tenant A must not read tenant B rows"
+            );
+            assert_eq!(
+                count_where(&mut tx, "WHERE contract_id = 'CTENANT-B'").await,
+                0,
+                "tenant A must not read tenant B rows via another column"
+            );
+            tx.rollback().await.unwrap();
+        }
+        {
+            let mut tx = scoped_tx(&pool, Some(&role), Some(TENANT_B)).await;
+            assert_eq!(count_where(&mut tx, "").await, 2, "tenant B sees only its own rows");
+            assert_eq!(
+                count_where(&mut tx, &format!("WHERE tenant_id = '{TENANT_A}'")).await,
+                0,
+                "tenant B must not read tenant A rows"
+            );
+            tx.rollback().await.unwrap();
+        }
+        {
+            // A tenant with no rows sees nothing at all.
+            let mut tx = scoped_tx(&pool, Some(&role), Some("tenant-c")).await;
+            assert_eq!(count_where(&mut tx, "").await, 0);
+            tx.rollback().await.unwrap();
+        }
+
+        drop_app_role(&pool, &role).await;
+    }
+
+    /// Test 33 — Querying a partition directly (bypassing the parent) is
+    /// still isolated.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_33_rls_direct_partition_access_isolated(pool: PgPool) {
+        seed_two_tenants(&pool).await;
+        let role = create_app_role(&pool, "SELECT").await;
+        sqlx::query(&format!("GRANT SELECT ON events_2026_01 TO {role}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = scoped_tx(&pool, Some(&role), Some(TENANT_A)).await;
+        let cross: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events_2026_01 WHERE tenant_id = 'tenant-b'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(cross, 0, "direct partition access must not leak tenant B rows");
+        tx.rollback().await.unwrap();
+
+        drop_app_role(&pool, &role).await;
+    }
+
+    /// Test 34 — A tenant-scoped session cannot write rows for another tenant
+    /// (WITH CHECK), and UPDATE/DELETE of another tenant's rows affect 0 rows.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_34_rls_cross_tenant_writes_blocked(pool: PgPool) {
+        seed_two_tenants(&pool).await;
+        let role = create_app_role(&pool, "SELECT, INSERT, UPDATE, DELETE").await;
+
+        // INSERT a row stamped with another tenant's ID → rejected.
+        {
+            let mut tx = scoped_tx(&pool, Some(&role), Some(TENANT_A)).await;
+            let err = sqlx::query(
+                "INSERT INTO events \
+                     (contract_id, event_type, tx_hash, ledger, timestamp, event_data, tenant_id) \
+                 VALUES ('CX', 'contract', 'tx-forged', 1, $1::timestamptz, '{}'::jsonb, 'tenant-b')",
+            )
+            .bind(EVENT_TS)
+            .execute(&mut *tx)
+            .await
+            .expect_err("cross-tenant INSERT must be rejected by RLS");
+            assert!(
+                err.to_string().contains("row-level security"),
+                "unexpected error: {err}"
+            );
+            tx.rollback().await.unwrap();
+        }
+
+        // UPDATE / DELETE of another tenant's rows → 0 rows affected.
+        {
+            let mut tx = scoped_tx(&pool, Some(&role), Some(TENANT_A)).await;
+            let updated = sqlx::query("UPDATE events SET ledger = ledger + 1 WHERE tenant_id = 'tenant-b'")
+                .execute(&mut *tx)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(updated, 0, "tenant A must not update tenant B rows");
+
+            let deleted = sqlx::query("DELETE FROM events WHERE tenant_id = 'tenant-b'")
+                .execute(&mut *tx)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(deleted, 0, "tenant A must not delete tenant B rows");
+
+            // Re-stamping an own row as another tenant is also rejected.
+            let err = sqlx::query("UPDATE events SET tenant_id = 'tenant-b' WHERE tenant_id = 'tenant-a'")
+                .execute(&mut *tx)
+                .await
+                .expect_err("moving a row to another tenant must be rejected");
+            assert!(err.to_string().contains("row-level security"), "unexpected error: {err}");
+            tx.rollback().await.unwrap();
+        }
+
+        // Tenant B's data is untouched.
+        let b_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE tenant_id = 'tenant-b'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(b_rows, 2);
+
+        drop_app_role(&pool, &role).await;
+    }
+
+    /// Test 35 — The superuser still reads every row (admin operations),
+    /// even when a tenant scope is set on the session.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_35_rls_superuser_reads_all_rows(pool: PgPool) {
+        let is_superuser: bool =
+            sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            is_superuser,
+            "these tests require DATABASE_URL to connect as a PostgreSQL superuser"
+        );
+
+        seed_two_tenants(&pool).await;
+
+        let mut tx = scoped_tx(&pool, None, Some(TENANT_A)).await;
+        assert_eq!(count_where(&mut tx, "").await, 5, "superuser bypasses RLS");
+        assert_eq!(
+            count_where(&mut tx, &format!("WHERE tenant_id = '{TENANT_B}'")).await,
+            2,
+            "superuser reads tenant B rows while scoped to tenant A"
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    /// Test 36 — An unscoped session (GUC never set → NULL, or set to '')
+    /// behaves identically. Unscoped access is the documented admin/indexer
+    /// path; the important property is that NULL and '' do not diverge.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_36_rls_unset_and_empty_scope_are_equivalent(pool: PgPool) {
+        seed_two_tenants(&pool).await;
+        let role = create_app_role(&pool, "SELECT").await;
+
+        let mut tx = scoped_tx(&pool, Some(&role), None).await;
+        let unset = count_where(&mut tx, "").await;
+        tx.rollback().await.unwrap();
+
+        let mut tx = scoped_tx(&pool, Some(&role), Some("")).await;
+        let empty = count_where(&mut tx, "").await;
+        tx.rollback().await.unwrap();
+
+        assert_eq!(unset, empty, "NULL and '' tenant scope must behave the same");
+        assert_eq!(unset, 5);
+
+        drop_app_role(&pool, &role).await;
+    }
+
+    /// Test 37 — The tenant scope set with SET LOCAL ends with the
+    /// transaction, so a pooled connection cannot carry tenant A's scope into
+    /// the next request.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_37_rls_scope_does_not_leak_across_transactions(pool: PgPool) {
+        seed_two_tenants(&pool).await;
+        let role = create_app_role(&pool, "SELECT").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await.unwrap();
+            sqlx::query(&format!("SET LOCAL ROLE {role}"))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("SELECT set_config('app.current_tenant_id', 'tenant-a', true)")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let scope: Option<String> =
+            sqlx::query_scalar("SELECT current_setting('app.current_tenant_id', TRUE)")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert!(
+            scope.as_deref().unwrap_or("").is_empty(),
+            "tenant scope leaked past COMMIT: {scope:?}"
+        );
+        drop(conn);
+
+        drop_app_role(&pool, &role).await;
+    }
 }

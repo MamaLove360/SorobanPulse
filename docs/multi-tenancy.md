@@ -99,15 +99,111 @@ CREATE TABLE tenant_rls_policies (
 );
 ```
 
-### Row-Level Security Policies
+### Row-Level Security (RLS) setup
+
+RLS is a **second layer of defence**. The primary control is the
+application-level `tenant_id` filter that handlers add to every query. RLS
+makes sure that a bug in that filter cannot leak another tenant's rows.
+
+#### Migrations
+
+| Migration | What it does |
+|-----------|--------------|
+| `20260527000001_rls_events.sql` | Original policy on the (then unpartitioned) `events` table. |
+| `20260727000102_partition_events_by_month.sql` | Renamed that table to `events_legacy` and promoted the partitioned table to `events`. **The policy stayed on `events_legacy`, so the live table was unprotected.** |
+| `20261022000001_rls_events_partitioned.sql` | Issue #1344: re-applies RLS to the partitioned `events` table, every existing partition and `events_legacy`, fixes the NULL/`''` scope handling, adds `WITH CHECK`, and makes `auto_create_partitions()` protect new partitions. |
+
+#### Policy
+
+`apply_events_partition_rls(regclass)` installs this policy on `events` and on each partition:
 
 ```sql
--- Example RLS policy on events table
-CREATE POLICY tenant_isolation ON events
-    FOR SELECT
-    USING (tenant_id = current_setting('app.tenant_id'));
-
 ALTER TABLE events ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON events
+    USING (                                   -- which rows are visible (SELECT/UPDATE/DELETE)
+        tenant_id IS NULL                                                   -- legacy single-tenant rows
+        OR COALESCE(current_setting('app.current_tenant_id', TRUE), '') = '' -- unscoped session
+        OR tenant_id = current_setting('app.current_tenant_id', TRUE)        -- own tenant
+    )
+    WITH CHECK (                              -- which rows may be written (INSERT/UPDATE)
+        COALESCE(current_setting('app.current_tenant_id', TRUE), '') = ''
+        OR tenant_id = current_setting('app.current_tenant_id', TRUE)
+    );
+```
+
+| Session state | Can read | Can write |
+|---------------|----------|-----------|
+| `app.current_tenant_id = 'tenant-a'` | `tenant-a` rows (and legacy `NULL` rows) | only rows with `tenant_id = 'tenant-a'` |
+| GUC never set (NULL) or set to `''` | all rows (unscoped: indexer, admin jobs) | any row |
+| Superuser or `BYPASSRLS` role | all rows, whatever the scope | any row |
+| Table owner | all rows, unless `FORCE ROW LEVEL SECURITY` is set | any row |
+
+#### Scoping a request
+
+Set the tenant **per transaction** with `SET LOCAL` semantics, so the scope
+cannot leak to the next request that reuses a pooled connection:
+
+```rust
+let mut tx = pool.begin().await?;
+sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)") // true = transaction-local
+    .bind(&tenant_id)
+    .execute(&mut *tx)
+    .await?;
+let rows = sqlx::query_as::<_, Event>("SELECT * FROM events ORDER BY ledger DESC LIMIT 20")
+    .fetch_all(&mut *tx)
+    .await?;
+tx.commit().await?;
+```
+
+#### Recommended roles
+
+PostgreSQL skips RLS for superusers, for `BYPASSRLS` roles and for the
+table owner. For the policy to apply, the API must connect as a role that is
+none of these:
+
+```sql
+-- Owns the schema and runs migrations (bypasses RLS as owner).
+CREATE ROLE soroban_pulse_owner LOGIN PASSWORD '...';
+
+-- Used by the HTTP API. RLS applies.
+CREATE ROLE soroban_pulse_app LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
+GRANT USAGE ON SCHEMA public TO soroban_pulse_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO soroban_pulse_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE soroban_pulse_owner IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO soroban_pulse_app;
+```
+
+If one role must both own the tables and serve requests, add
+`ALTER TABLE events FORCE ROW LEVEL SECURITY;`. Be aware that `pg_dump` run
+as that role will then fail, so run backups as a superuser or a
+`BYPASSRLS` role.
+
+Admin operations (backups, support queries, re-indexing) run as a superuser
+or `BYPASSRLS` role and always see every row.
+
+#### Partitions
+
+A policy on a partitioned parent table is not checked when someone queries a
+partition directly (for example `SELECT * FROM events_2026_01`). That is why
+every partition gets its own copy of the policy:
+
+- Existing partitions are covered by migration `20261022000001`.
+- Partitions created by `auto_create_partitions()` are covered automatically.
+- Any partition you create by hand must be protected explicitly:
+
+  ```sql
+  CREATE TABLE events_2027_01 PARTITION OF events
+      FOR VALUES FROM ('2027-01-01') TO ('2027-02-01');
+  SELECT apply_events_partition_rls('events_2027_01');
+  ```
+
+Use this query to find unprotected partitions. It should return 0 rows:
+
+```sql
+SELECT c.relname
+  FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+ WHERE i.inhparent = 'events'::regclass AND NOT c.relrowsecurity;
 ```
 
 ## Tenant Provisioning
@@ -233,14 +329,29 @@ Tests cover:
 ### Integration Tests
 
 ```bash
-cargo test --test '*multi_tenant*'
+# Needs a PostgreSQL superuser, e.g. `docker compose -f docker-compose.test.yml up -d`
+export DATABASE_URL=postgres://postgres:postgres@localhost/soroban_pulse_test
+cargo test --test multi_tenant_isolation_tests
 ```
 
-Scenarios:
-- Cross-tenant isolation (verify isolation failures)
-- Concurrent tenant access
-- RLS policy enforcement
-- Audit logging of access attempts
+`tests/multi_tenant_isolation_tests.rs` covers auth-level tenant resolution
+(tests 1–30) and, in the `rls` module, database-level isolation against a
+real PostgreSQL instance (tests 31–37). Each RLS test runs in its own
+database created by `#[sqlx::test]` with every migration applied, and
+switches to a throwaway `NOSUPERUSER NOBYPASSRLS` role:
+
+| Test | Verifies |
+|------|----------|
+| 31 | RLS and `tenant_isolation` are enabled on the partitioned `events` table and on every partition |
+| 32 | With two tenants seeded, each scoped session sees only its own rows; cross-tenant queries return 0 rows |
+| 33 | Querying a partition directly is still isolated |
+| 34 | Cross-tenant `INSERT` and re-stamping are rejected; cross-tenant `UPDATE`/`DELETE` affect 0 rows |
+| 35 | A superuser still reads every row, even with a tenant scope set |
+| 36 | An unset (NULL) scope and an empty (`''`) scope behave the same |
+| 37 | A `SET LOCAL` scope does not survive `COMMIT` on a pooled connection |
+
+CI runs the suite against PostgreSQL 15 and 16 in the
+`multi-tenant-rls` job of `.github/workflows/ci.yml`.
 
 ## Migration Guide
 

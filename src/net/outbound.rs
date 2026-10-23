@@ -207,12 +207,27 @@ pub fn validate_outbound_url_static(
 /// domain enforcement happens in [`validate_outbound_url`].  The parameter
 /// is accepted here as a documentation hint so callers are aware they should
 /// have called the validator first.
-pub fn build_outbound_client(_allowed_domains: &[&str]) -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
+pub fn build_outbound_client(
+    _allowed_domains: &[&str],
+) -> Result<reqwest::Client, crate::error::InitError> {
+    build_http_client(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10)),
+        "outbound",
+    )
+}
+
+/// Finish a [`reqwest::ClientBuilder`], mapping a build failure (TLS backend
+/// initialisation, invalid builder option) to a typed [`InitError`] instead
+/// of panicking.
+pub fn build_http_client(
+    builder: reqwest::ClientBuilder,
+    component: &'static str,
+) -> Result<reqwest::Client, crate::error::InitError> {
+    builder
         .build()
-        .expect("Failed to build outbound HTTP client")
+        .map_err(|source| crate::error::InitError::HttpClient { component, source })
 }
 
 // ---------------------------------------------------------------------------

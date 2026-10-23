@@ -1,0 +1,94 @@
+name: Security Audit
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # Daily at 2 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit
+        id: audit
+        continue-on-error: true
+        run: |
+          cargo audit --json > audit-results.json
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Parse audit results
+        id: parse
+        if: steps.audit.outputs.status != '0'
+        run: |
+          if ! jq -e '.vulnerabilities.list | length > 0' audit-results.json > /dev/null; then
+            echo "No vulnerabilities found"
+            exit 0
+          fi
+
+          # Extract vulnerability details
+          jq -r '.vulnerabilities.list[] | 
+            "**" + .advisory.id + "** - " + .advisory.title + "\n" +
+            "- **Package:** " + .package.name + " " + .package.version + "\n" +
+            "- **Severity:** " + (.advisory.severity // "unknown") + "\n" +
+            "- **URL:** " + .advisory.url + "\n" +
+            "- **Patched versions:** " + (.versions.patched | join(", ")) + "\n"
+          ' audit-results.json > vulnerability-details.txt
+
+          # Create issue body
+          {
+            echo "## 🚨 Security Advisory"
+            echo ""
+            echo "New security vulnerabilities detected in dependencies:"
+            echo ""
+            cat vulnerability-details.txt
+            echo ""
+            echo "---"
+            echo "Run \`cargo audit\` locally for details or \`cargo update\` to patch."
+          } > issue-body.txt
+
+          echo "has_vulns=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create Security Advisory issue
+        if: steps.parse.outputs.has_vulns == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const issueBody = fs.readFileSync('issue-body.txt', 'utf8');
+            
+            // Check if a similar issue already exists
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'security,automated',
+              per_page: 10
+            });
+
+            const today = new Date().toISOString().split('T')[0];
+            const issueTitle = `Security Advisory: Vulnerabilities detected (${today})`;
+
+            // Don't create duplicate issues for the same day
+            const duplicateExists = existingIssues.data.some(
+              issue => issue.title === issueTitle
+            );
+
+            if (!duplicateExists) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body: issueBody,
+                labels: ['security', 'automated', 'priority: critical']
+              });
+            }

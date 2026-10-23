@@ -268,7 +268,7 @@ impl FlagMetrics {
     }
 
     fn counters_for(&self, flag_name: &str) -> Arc<FlagCounters> {
-        let mut guard = self.counters.lock().unwrap();
+        let mut guard = self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .entry(flag_name.to_string())
             .or_insert_with(|| Arc::new(FlagCounters::default()))
@@ -287,20 +287,20 @@ impl FlagMetrics {
 
     pub fn record_variant_assignment(&self, flag_name: &str, variant_name: &str) {
         let counters = self.counters_for(flag_name);
-        let mut variants = counters.variant_assignments.lock().unwrap();
+        let mut variants = counters.variant_assignments.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *variants.entry(variant_name.to_string()).or_insert(0) += 1;
     }
 
     /// Snapshot of evaluation counts and enabled-rate per flag, for a metrics endpoint.
     pub fn snapshot(&self) -> Vec<FlagMetricsSnapshot> {
-        let guard = self.counters.lock().unwrap();
+        let guard = self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .iter()
             .map(|(name, counters)| {
                 let evaluations = counters.evaluations.load(Ordering::Relaxed);
                 let enabled = counters.enabled.load(Ordering::Relaxed);
                 let disabled = counters.disabled.load(Ordering::Relaxed);
-                let variants = counters.variant_assignments.lock().unwrap().clone();
+                let variants = counters.variant_assignments.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                 FlagMetricsSnapshot {
                     flag_name: name.clone(),
                     evaluations,
@@ -341,7 +341,7 @@ pub async fn is_feature_enabled_with_metrics(
     Ok(result)
 }
 
-pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<bool>) {
+pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let watcher = FeatureFlagWatcher::new(pool);
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -357,7 +357,7 @@ pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

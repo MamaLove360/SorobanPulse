@@ -92,8 +92,7 @@ pub fn record_counter_state(counter_name: &str, value: u64) {
 /// SLO-aligned histogram buckets for HTTP request duration (seconds).
 const HTTP_DURATION_BUCKETS: &[f64] = &[0.05, 0.1, 0.2, 0.5, 1.0, 5.0];
 
-/// Initialize the Prometheus metrics exporter
-pub fn init_metrics() -> PrometheusHandle {
+fn prometheus_builder() -> PrometheusBuilder {
     PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(
@@ -101,14 +100,51 @@ pub fn init_metrics() -> PrometheusHandle {
             ),
             HTTP_DURATION_BUCKETS,
         )
-        .expect("Failed to set histogram buckets")
-        .install_recorder()
-        .expect("Failed to install Prometheus exporter")
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Invalid HTTP duration buckets; using exporter defaults");
+            PrometheusBuilder::new()
+        })
+}
+
+/// Initialize the Prometheus metrics exporter.
+///
+/// Installing the global recorder fails if one is already installed (e.g. a
+/// second call within the same test binary). Rather than panicking, return a
+/// handle to a detached recorder so callers still get a working `/metrics`
+/// renderer.
+pub fn init_metrics() -> PrometheusHandle {
+    match prometheus_builder().install_recorder() {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(error = %e, "Prometheus recorder already installed; returning a detached handle");
+            prometheus_builder().build_recorder().handle()
+        }
+    }
 }
 
 /// Record events indexed
 pub fn record_events_indexed(count: u64) {
     m::counter!("soroban_pulse_events_indexed_total").increment(count);
+}
+
+/// Issue #1252: highest ledger a Galexie backfill run has fully processed.
+pub fn update_backfill_progress_ledger(ledger: u64) {
+    m::gauge!("soroban_pulse_backfill_progress_ledger").set(ledger as f64);
+}
+
+/// Issue #1252: ledgers processed by backfill.
+pub fn record_backfill_ledgers(count: u64) {
+    m::counter!("soroban_pulse_backfill_ledgers_total").increment(count);
+}
+
+/// Issue #1252: events newly inserted by backfill (duplicates excluded).
+pub fn record_backfill_events(count: u64) {
+    m::counter!("soroban_pulse_backfill_events_total").increment(count);
+}
+
+/// Issue #1255: a contract entered the deployment registry.
+pub fn record_contract_tracked() {
+    m::counter!("soroban_pulse_contracts_tracked_total").increment(1);
 }
 
 /// Update the current ledger being processed
@@ -144,6 +180,7 @@ pub fn record_indexer_is_leader(is_leader: bool) {
 /// Record an RPC error
 pub fn record_rpc_error() {
     m::counter!("soroban_pulse_rpc_errors_total").increment(1);
+    record_error_by_kind("rpc");
 }
 
 /// Record a validation failure
@@ -221,6 +258,17 @@ pub fn update_reencrypt_progress(remaining: u64) {
     m::gauge!("soroban_pulse_reencrypt_progress").set(remaining as f64);
 }
 
+/// Update the key-rotation progress gauge as a fraction of rows completed
+/// (issue #1270). `rows_total == 0` reports 0.0 rather than NaN.
+pub fn update_reencryption_progress(rows_completed: u64, rows_total: u64) {
+    let ratio = if rows_total == 0 {
+        0.0
+    } else {
+        (rows_completed as f64 / rows_total as f64).clamp(0.0, 1.0)
+    };
+    m::gauge!("soroban_pulse_reencryption_progress").set(ratio);
+}
+
 /// Record a re-encryption error (issue #372)
 pub fn record_reencrypt_error() {
     m::counter!("soroban_pulse_reencrypt_errors_total").increment(1);
@@ -261,6 +309,18 @@ pub fn record_rate_limit_rejected() {
     m::counter!("soroban_pulse_rate_limit_rejected_total").increment(1);
 }
 
+/// Record a subscription registration rejected by the per-IP rate limit
+/// (issue #1268).
+pub fn record_subscription_rate_limited() {
+    m::counter!("soroban_pulse_subscription_rate_limited_total").increment(1);
+}
+
+/// Record an SSE connection rejected by the per-IP connection limit
+/// (issue #1268).
+pub fn record_sse_rate_limited() {
+    m::counter!("soroban_pulse_sse_rate_limited_total").increment(1);
+}
+
 /// Record that a notification was suppressed by a suppression list.
 pub fn record_notification_suppressed() {
     m::counter!("soroban_pulse_notification_suppressed_total").increment(1);
@@ -275,6 +335,7 @@ pub fn record_notification_failover(channel: &str) {
 /// Record a persistent webhook delivery failure (all retries exhausted)
 pub fn record_webhook_failure() {
     m::counter!("soroban_pulse_webhook_failures_total").increment(1);
+    record_error_by_kind("webhook");
 }
 
 /// Record a PagerDuty delivery failure (all retries exhausted)
@@ -337,6 +398,19 @@ pub fn set_rpc_active_endpoint(endpoint: &str) {
     m::gauge!("soroban_pulse_rpc_active_endpoint", "url" => endpoint.to_string()).set(1.0);
 }
 
+/// Issue #1256: p50 probe latency of an RPC endpoint, in milliseconds.
+pub fn set_rpc_endpoint_latency_ms(endpoint: &str, latency_ms: f64) {
+    m::gauge!("soroban_pulse_rpc_endpoint_latency_ms", "endpoint" => endpoint.to_string())
+        .set(latency_ms);
+}
+
+/// Issue #1256: whether an RPC endpoint is in rotation (1) or marked
+/// unavailable after repeated errors (0).
+pub fn set_rpc_endpoint_available(endpoint: &str, available: bool) {
+    m::gauge!("soroban_pulse_rpc_endpoint_available", "endpoint" => endpoint.to_string())
+        .set(if available { 1.0 } else { 0.0 });
+}
+
 /// Record a Kinesis ProvisionedThroughputExceededException (throttled record)
 pub fn record_kinesis_throttled() {
     m::counter!("soroban_pulse_kinesis_throttled_total").increment(1);
@@ -345,6 +419,19 @@ pub fn record_kinesis_throttled() {
 /// Record an email notification failure
 pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
+    record_error_by_kind("email");
+}
+
+/// Unified error counter: incremented from each error-generating module
+/// with a kind label (rpc, webhook, email, db, sse)
+pub fn record_error_by_kind(kind: &str) {
+    m::counter!("soroban_pulse_errors_total", "kind" => kind.to_string()).increment(1);
+}
+
+/// Record a partition drop event
+pub fn record_partition_dropped(partition_name: &str) {
+    m::counter!("soroban_pulse_partitions_dropped_total", "partition" => partition_name.to_string())
+        .increment(1);
 }
 
 /// Record an email bounce reported via the bounce webhook (Issue #484)
@@ -424,6 +511,31 @@ pub fn update_pool_utilization(pool: &PgPool, max_connections: u32) {
     m::gauge!("soroban_pulse_db_pool_utilization").set(utilization);
     m::gauge!("soroban_pulse_db_pool_active_connections").set(active);
     m::gauge!("soroban_pulse_db_pool_max_connections").set(max);
+    // Names documented in README.md ("Database pool metrics").
+    m::gauge!("soroban_pulse_db_pool_size").set(size);
+    m::gauge!("soroban_pulse_db_pool_idle").set(idle);
+    m::gauge!("soroban_pulse_db_pool_max").set(max);
+}
+
+/// Issue #1244: adaptive tuner recommendations (see `db_pool::adaptive`).
+pub fn update_pool_adaptive_targets(recommended_min: u32, recommended_max: u32) {
+    m::gauge!("soroban_pulse_db_pool_adaptive_target_min").set(f64::from(recommended_min));
+    m::gauge!("soroban_pulse_db_pool_adaptive_target_max").set(f64::from(recommended_max));
+}
+
+/// Issue #1244: a failed adaptive-tuner keepalive ping.
+pub fn record_pool_health_check_failure() {
+    m::counter!("soroban_pulse_db_pool_health_check_failures_total").increment(1);
+}
+
+/// Issue #1244: idle connections flagged as potentially stale by the tuner.
+pub fn record_pool_stale_connections(count: u64) {
+    m::counter!("soroban_pulse_db_pool_stale_connections_total").increment(count);
+}
+
+/// Issue #1244: a tracked acquisition that hit its timeout.
+pub fn record_pool_acquire_timeout() {
+    m::counter!("soroban_pulse_db_pool_acquire_timeout_total").increment(1);
 }
 
 /// Issue #622: Record connection acquisition latency.
@@ -518,6 +630,19 @@ pub fn update_sse_connections(count: usize) {
 /// Update the active WebSocket connections count
 pub fn update_ws_connections(count: usize) {
     m::gauge!("soroban_pulse_ws_active_connections").set(count as f64);
+}
+
+/// Record SSE connection event (connected, disconnected, or error)
+pub fn record_sse_connection_event(result: &str) {
+    m::counter!("soroban_pulse_sse_connections_total", "result" => result.to_string()).increment(1);
+    if result == "error" {
+        record_error_by_kind("sse");
+    }
+}
+
+/// Record SSE connection duration (seconds) - duration from connection to disconnection
+pub fn record_sse_connection_duration(duration_secs: f64) {
+    m::histogram!("soroban_pulse_sse_connection_duration_seconds").record(duration_secs);
 }
 
 /// Record timeseries query duration
@@ -636,6 +761,18 @@ pub fn record_bloom_filter_rotation() {
     m::counter!("soroban_pulse_bloom_filter_rotations_total").increment(1);
 }
 
+/// Issue #XXX: Update the estimated false-positive rate of the bloom filter.
+/// Estimated from current fill ratio and filter parameters.
+pub fn set_bloom_false_positive_rate(rate: f64) {
+    m::gauge!("soroban_pulse_bloom_false_positive_rate").set(rate);
+}
+
+/// Issue #XXX: Record a webhook delivery trace error for end-to-end observability.
+#[cfg(feature = "full-observability")]
+pub fn record_webhook_trace_error() {
+    m::counter!("soroban_pulse_webhook_trace_errors_total").increment(1);
+}
+
 /// Record SSE per-IP connection count (histogram, issue #453)
 pub fn record_sse_connections_per_ip(count: usize) {
     m::histogram!("soroban_pulse_sse_connections_per_ip").record(count as f64);
@@ -706,14 +843,14 @@ pub fn update_process_memory_bytes() {
 
 /// Spawn a background task that updates process memory every 30 seconds (Linux only).
 #[cfg(target_os = "linux")]
-pub fn spawn_memory_collector() {
+pub fn spawn_memory_collector() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
             update_process_memory_bytes();
         }
-    });
+    })
 }
 
 /// #513: Record notification delivery latency per channel
@@ -756,6 +893,27 @@ pub fn update_contract_event_count(contract_id: &str, count: i64) {
         "contract_id" => contract_id.to_string()
     )
     .set(count as f64);
+}
+
+/// Issue #1257: per-contract resource usage for the Grafana "Contract
+/// Resource Usage" panels. Only the top contracts by total fee are exported.
+pub fn update_contract_resource_stats(
+    contract_id: &str,
+    total_resource_fee: Option<i64>,
+    avg_cpu_insns: Option<f64>,
+    avg_mem_bytes: Option<f64>,
+) {
+    let label = contract_id.to_string();
+    if let Some(v) = total_resource_fee {
+        m::gauge!("soroban_pulse_contract_resource_fee_total", "contract_id" => label.clone())
+            .set(v as f64);
+    }
+    if let Some(v) = avg_cpu_insns {
+        m::gauge!("soroban_pulse_contract_cpu_insns_avg", "contract_id" => label.clone()).set(v);
+    }
+    if let Some(v) = avg_mem_bytes {
+        m::gauge!("soroban_pulse_contract_mem_bytes_avg", "contract_id" => label).set(v);
+    }
 }
 
 /// #695: Record an observation of indexer lag for heatmap distribution.
@@ -1310,6 +1468,7 @@ pub fn record_postgres_health_degraded(response_time_ms: u64) {
 pub fn record_postgres_health_error(response_time_ms: u64) {
     m::counter!("soroban_pulse_postgres_health_checks_total", "status" => "error").increment(1);
     m::histogram!("soroban_pulse_postgres_health_check_duration_ms").record(response_time_ms as f64);
+    record_error_by_kind("db");
 }
 
 /// Record successful RPC health check
@@ -1478,6 +1637,13 @@ pub fn record_slo_status_transition(slo: &str, status: &str) {
         "status" => status.to_string()
     )
     .increment(1);
+}
+
+// ── Issue #1248: Background job scheduler ───────────────────────────────────
+
+/// Number of `JobScheduler` jobs that are still running.
+pub fn set_background_jobs_alive(count: usize) {
+    m::gauge!("soroban_pulse_background_jobs_alive").set(count as f64);
 }
 
 // ── Issue #630: Resource utilization metrics ────────────────────────────────
@@ -1656,6 +1822,86 @@ pub fn update_active_alerts_count(component: &str, count: u64) {
         "component" => component.to_string()
     )
     .set(count as f64);
+}
+
+// ── Issue #1260: Webhook dead-letter queue metrics ──────────────────────────
+
+/// Update the current depth of the webhook dead-letter queue.
+///
+/// Published on every DLQ insert, delete, and replay so operators can alert on
+/// a growing backlog of webhooks that exhausted all delivery retries.
+pub fn update_webhook_dlq_depth(count: u64) {
+    m::gauge!("soroban_pulse_webhook_dlq_depth").set(count as f64);
+}
+
+// ── Issue #1262: Derived metrics framework ──────────────────────────────────
+
+/// Publish the current value of a user-defined derived metric.
+///
+/// The metric name is `soroban_pulse_derived_<name>` and carries a
+/// `derived=true` label so derived series can be selected independently of
+/// built-in metrics in Prometheus queries.
+pub fn update_derived_metric(name: &str, value: f64) {
+    let safe = if value.is_finite() { value } else { 0.0 };
+    m::gauge!(
+        "soroban_pulse_derived_metric",
+        "name" => name.to_string(),
+        "derived" => "true"
+    )
+    .set(safe);
+}
+
+/// Record how long a single derived metric evaluation took.
+pub fn record_derived_metric_evaluation_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_derived_metrics_evaluation_duration_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Record a failed derived metric evaluation (query error, evaluator panic, ...).
+pub fn record_derived_metric_evaluation_error() {
+    m::counter!("soroban_pulse_derived_metrics_evaluation_errors_total").increment(1);
+}
+
+/// Record a derived metric definition that failed to parse.
+pub fn record_derived_metric_parse_error() {
+    m::counter!("soroban_pulse_derived_metrics_parse_errors_total").increment(1);
+}
+
+// ── Issue #1263: Incident correlation metrics ───────────────────────────────
+
+/// Record an incident created by the correlation engine.
+pub fn record_incident_created(kind: &str, severity: &str) {
+    m::counter!(
+        "soroban_pulse_incidents_created_total",
+        "kind" => kind.to_string(),
+        "severity" => severity.to_string()
+    )
+    .increment(1);
+}
+
+/// Record an incident resolved (manually or automatically).
+pub fn record_incident_resolved(kind: &str) {
+    m::counter!(
+        "soroban_pulse_incidents_resolved_total",
+        "kind" => kind.to_string()
+    )
+    .increment(1);
+}
+
+/// Update the number of currently open incidents.
+pub fn update_open_incidents(count: u64) {
+    m::gauge!("soroban_pulse_incidents_open").set(count as f64);
+}
+
+/// Record how long a correlation pass took.
+pub fn record_correlation_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_correlation_duration_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Record a detector error encountered while gathering correlation inputs.
+pub fn record_detector_error() {
+    m::counter!("soroban_pulse_detector_errors_total").increment(1);
 }
 
 #[cfg(test)]

@@ -247,11 +247,9 @@ pub async fn replay_from_timestamp(
     .await
     .map_err(|e| format!("Failed to get start ledger: {}", e))?;
 
-    if start_ledger.is_none() {
+    let Some(start_ledger) = start_ledger else {
         return Err("No events found from specified timestamp".to_string());
-    }
-
-    let start_ledger = start_ledger.unwrap();
+    };
 
     let end_ledger = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(ledger) FROM events"

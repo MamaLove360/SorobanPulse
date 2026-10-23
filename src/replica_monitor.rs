@@ -635,7 +635,7 @@ pub async fn query_replication_status(pool: &PgPool) -> Vec<serde_json::Value> {
 }
 
 /// Backward-compatible background spawn using simple interval loop.
-pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<bool>) {
+pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -652,7 +652,7 @@ pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<
                 }
             }
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------

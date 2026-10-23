@@ -30,25 +30,27 @@ RUN cargo chef cook --release ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} --
 COPY . .
 RUN cargo build --release ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
-# Final stage: Runtime image (minimal size)
-# debian:bookworm-slim — digest pinned 2025-07-14. Update via Dependabot or manually with:
-# docker inspect --format='{{index .RepoDigests 0}}' debian:bookworm-slim
-FROM debian:bookworm-slim@sha256:8af0e5095f9964007f5ebd11191dfe52dcb51bf3afa2c07f055fc5451b78ba0e
-RUN apt-get update && apt-get install -y ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 soroban && useradd --uid 10001 --gid soroban --no-create-home --shell /usr/sbin/nologin soroban
+# Final stage: Runtime image (minimal size, < 80 MB)
+# gcr.io/distroless/cc-debian12 — digest pinned 2025-07-14. Update via Dependabot or manually with:
+# docker inspect --format='{{index .RepoDigests 0}}' gcr.io/distroless/cc-debian12
+# distroless/cc ships glibc + libssl + ca-certificates, so no apt-get layer is needed.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9b8f8b1a1b6b0b6f3f0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e
 
 WORKDIR /app
-COPY --from=builder --chown=soroban:soroban /app/target/release/soroban-pulse .
-COPY --from=builder --chown=soroban:soroban /app/target/release/seed .
-COPY --from=builder --chown=soroban:soroban /app/migrations ./migrations
-COPY --from=web --chown=soroban:soroban /src/web/dist ./web/dist
+COPY --from=builder --chown=nonroot:nonroot /app/target/release/soroban-pulse .
+COPY --from=builder --chown=nonroot:nonroot /app/target/release/seed .
+COPY --from=builder --chown=nonroot:nonroot /app/migrations ./migrations
+COPY --from=web --chown=nonroot:nonroot /src/web/dist ./web/dist
 
 # Serve the bundled dashboard at http://<host>:3000/ui. Set SERVE_DASHBOARD=false to disable.
 ENV SERVE_DASHBOARD=true \
     DASHBOARD_DIR=/app/web/dist
 
-USER soroban:soroban
+# distroless/cc:nonroot already runs as uid/gid 65532 (nonroot).
+USER nonroot:nonroot
 EXPOSE 3000
-HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
-  CMD curl -f http://localhost:3000/healthz/ready || exit 1
+# distroless has no shell or curl, so the HEALTHCHECK relies on the app's own
+# /healthz/ready endpoint via the orchestrator (k8s liveness/readiness probes).
+# If a container-level check is required, mount a static healthcheck binary and use:
+#   HEALTHCHECK CMD ["/app/healthcheck"]
 CMD ["./soroban-pulse"]

@@ -368,6 +368,167 @@ cloudwatch.put_metric_data(
 )
 ```
 
+## Multi-replica sizing
+
+The sections above cover a single instance. When you run several
+SorobanPulse replicas against one PostgreSQL primary (the default Terraform
+deployment runs `app_container_count = 2` ECS tasks), sizing changes in
+three ways:
+
+1. Every replica opens its **own** connection pool, so database connections
+   grow linearly with the replica count.
+2. Every replica takes part in **advisory-lock leader election** for the
+   indexer, which pins connections even while the replica is a standby.
+3. Only **one** replica (the leader) runs the indexer. The others are
+   standbys that serve HTTP traffic and poll for the lock.
+
+### How replicas use database connections
+
+| Consumer | Connections per replica | Source |
+|----------|------------------------|--------|
+| HTTP handler pool (primary) | up to `DB_MAX_CONNECTIONS` | `db::create_pool` in `src/main.rs` |
+| HTTP read pool (read replica) | up to `DB_MAX_CONNECTIONS` on the **replica** DB, only when `DATABASE_REPLICA_URL` is set; otherwise it shares the primary pool | `read_pool` in `src/main.rs` |
+| Advisory-lock connection | 1 pinned connection, held for the life of the indexer task (leader **and** standby) | `lock_conn` in `src/indexer.rs` |
+| Advisory-lock session | 1 more connection while the leader holds the lock (`pg_try_advisory_lock` is session-scoped) | `src/indexer.rs`, `src/advisory_lock.rs` |
+| Indexer writes (leader only) | 1–2 connections during batch inserts | `src/indexer.rs` |
+
+The lock and indexer connections come **out of** the same
+`DB_MAX_CONNECTIONS` pool. They are not extra connections on top of it, but
+they reduce what is left for HTTP requests.
+
+### Advisory lock overhead
+
+- **Connections:** budget `L = 2` connections per replica: the pinned lock
+  connection, plus the session that holds the lock on the leader. Standbys
+  use 1 of these 2 permanently.
+- **Queries:** each standby runs one `SELECT pg_try_advisory_lock($1)` every
+  `INDEXER_LOCK_RETRY_SECS` (default `30`). For `N` replicas that is
+  `(N − 1) / INDEXER_LOCK_RETRY_SECS` queries per second, about 0.07 q/s for
+  3 replicas, which is negligible for PostgreSQL.
+- **Failover time:** when the leader dies, its session ends and the lock is
+  released. A standby picks it up within at most `INDEXER_LOCK_RETRY_SECS`.
+  Lowering the interval speeds up failover, but each standby then polls more
+  often.
+- **Multi-network:** each `chain_id` uses its own lock key (Issue #1063).
+  With `K` networks indexed, use `L = 2 × K`.
+
+### Standby indexer CPU baseline
+
+A standby replica runs no indexing work, so its CPU use is its HTTP load
+plus the lock poll, and the poll is close to zero. Size the task as follows:
+
+- **Standby baseline:** use the HTTP-only CPU you measure for one replica at
+  `R / N` requests per second. With the Terraform default
+  (`ecs_task_cpu = 512`, 0.5 vCPU), an idle standby should stay well below
+  5% CPU.
+- **Leader:** standby baseline **plus** the indexer CPU, which depends on
+  ledger close rate and event volume. Measure it on a single instance first.
+- **Sizing rule:** any replica can become leader, so give **every** task
+  enough CPU for the leader workload. Keep the *leader's* CPU below 70% (the
+  auto-scaling target used elsewhere in this document).
+
+### Formulas
+
+| Symbol | Meaning | Default |
+|--------|---------|---------|
+| `N` | Replica count (`app_container_count`) | `2` |
+| `S` | Deployment surge factor (`deployment_maximum_percent / 100`) | `2.0` |
+| `P` | Pool size per replica (`DB_MAX_CONNECTIONS`) | `10` |
+| `R` | Total request rate across all replicas (req/s) | — |
+| `q` | Average DB queries per HTTP request | `1.5` (estimate) |
+| `t` | Average query time in seconds | `0.02` (20 ms, estimate) |
+| `h` | Headroom multiplier for bursts | `1.5` |
+| `L` | Advisory-lock connections per replica (`2 × K` networks) | `2` |
+| `I` | Indexer write connections (counted on every replica, since any can lead) | `2` |
+| `M` | PostgreSQL `max_connections` | RDS: `LEAST(DBInstanceClassMemory / 9531392, 5000)` |
+| `r` | Connections reserved for superusers, migrations and monitoring | `10` |
+
+**1. Concurrent HTTP connections needed per replica** (Little's law):
+
+```
+C_http = ceil( (R / N) × q × t × h )
+```
+
+**2. Pool size per replica:**
+
+```
+P ≥ C_http + L + I
+```
+
+**3. Connections on the primary database** in steady state and during a
+rolling deploy (ECS briefly runs old and new tasks side by side):
+
+```
+without DATABASE_REPLICA_URL:  C_primary = N × P
+with    DATABASE_REPLICA_URL:  C_primary = N × P        (HTTP reads go to the replica)
+                               C_replica = N × P
+
+peak during deploy:            C_peak    = ceil(S × N) × P
+```
+
+**4. Constraint.** Keep 20% spare capacity for the CapacityPlanner alert
+threshold:
+
+```
+C_peak ≤ 0.8 × (M − r)
+```
+
+**5. Largest pool you can safely configure** for a given `N`:
+
+```
+P_max = floor( 0.8 × (M − r) / ceil(S × N) )
+```
+
+If `P` from step 2 is larger than `P_max`, either move to a larger DB
+instance class, set `DATABASE_REPLICA_URL` to offload reads, or put
+PgBouncer in front of the primary.
+
+### Worked example: 3 replicas at 100 req/s
+
+Inputs: `N = 3`, `R = 100`, `q = 1.5`, `t = 0.02 s`, `h = 1.5`, `L = 2`,
+`I = 2`, `S = 2.0`, and the Terraform default `db_instance_class = "db.t3.medium"`
+(4 GiB RAM, which gives RDS `M ≈ 410`; confirm with `SHOW max_connections;`),
+`r = 10`.
+
+| Step | Calculation | Result |
+|------|-------------|--------|
+| 1. HTTP connections per replica | `ceil(100 / 3 × 1.5 × 0.02 × 1.5)` = `ceil(1.5)` | `C_http = 2` |
+| 2. Minimum pool per replica | `2 + 2 + 2` | `P ≥ 6`; keep the default **`DB_MAX_CONNECTIONS = 10`** |
+| 3a. Steady-state primary connections | `3 × 10` | `C_primary = 30` |
+| 3b. Peak during rolling deploy | `ceil(2.0 × 3) × 10` = `6 × 10` | `C_peak = 60` |
+| 4. Constraint check | `60 ≤ 0.8 × (410 − 10) = 320` | ✅ passes, 260 connections spare |
+| 5. Largest safe pool | `floor(320 / 6)` | `P_max = 53` |
+
+Recommended settings for this deployment:
+
+```hcl
+# terraform.tfvars
+app_container_count = 3
+db_instance_class   = "db.t3.medium"
+ecs_task_cpu        = 512    # every task must be able to run the leader workload
+ecs_task_memory     = 1024
+```
+
+```bash
+# container environment
+DB_MAX_CONNECTIONS=10
+DB_MIN_CONNECTIONS=2          # 3 × 2 = 6 idle connections held on the primary
+INDEXER_LOCK_RETRY_SECS=30    # failover in at most 30 s
+```
+
+The same formulas give the Terraform defaults (`N = 2`, `P = 10`):
+`C_primary = 20` and `C_peak = 40`, well inside `0.8 × (410 − 10) = 320`.
+That leaves room to scale to `N = 16` replicas at `P = 10`
+(`ceil(2 × 16) × 10 = 320`) before you need a larger instance class or a
+connection pooler.
+
+### Scaling checklist
+
+- [ ] Recalculate `C_peak` whenever you change `app_container_count`, `DB_MAX_CONNECTIONS` or `db_instance_class`.
+- [ ] Add 2 connections per replica for **each** extra network in `chain_id`s.
+- [ ] Alert on `soroban_pulse_db_pool_utilization` per replica, not just in aggregate.
+- [ ] Check `soroban_pulse_indexer_is_leader`: exactly one replica should report `1`.
+
 ## Related Issues
 
 - #588 - Performance Monitoring Dashboard

@@ -1,0 +1,175 @@
+name: Terraform CI
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - 'scripts/terraform-init.sh'
+  workflow_dispatch:
+    inputs:
+      TF_WORKSPACE:
+        description: 'Terraform workspace (environment) to plan'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  TF_VERSION: '1.7.5'
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan (${{ github.event.inputs.TF_WORKSPACE || 'staging' }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    env:
+      TF_WORKSPACE: ${{ github.event.inputs.TF_WORKSPACE || 'staging' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        continue-on-error: true
+
+      - name: Terraform Workspace Select
+        id: workspace
+        run: terraform workspace select "$TF_WORKSPACE" || terraform workspace new "$TF_WORKSPACE"
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -input=false -lock-timeout=5m \
+            -var-file="environments/${TF_WORKSPACE}/terraform.tfvars" \
+            -out=tfplan 2>&1 | tee plan_output.txt
+          exit ${PIPESTATUS[0]}
+        continue-on-error: true
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN: ${{ steps.plan.outputs.stdout }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const workspace = process.env.TF_WORKSPACE || 'staging';
+            const fmtOutcome = '${{ steps.fmt.outcome }}';
+            const initOutcome = '${{ steps.init.outcome }}';
+            const validateOutcome = '${{ steps.validate.outcome }}';
+            const planOutcome = '${{ steps.plan.outcome }}';
+
+            let planOutput = '';
+            try {
+              planOutput = fs.readFileSync(
+                path.join('terraform', 'plan_output.txt'),
+                'utf8'
+              );
+            } catch (err) {
+              planOutput = process.env.PLAN || '(no plan output available)';
+            }
+
+            // GitHub comment body limit is 65536 characters. Leave headroom for
+            // the surrounding markdown and truncation notice.
+            const MAX_LEN = 60000;
+            let truncated = false;
+            if (planOutput.length > MAX_LEN) {
+              planOutput = planOutput.slice(0, MAX_LEN);
+              truncated = true;
+            }
+
+            const statusIcon = (o) => (o === 'success' ? '✅' : '❌');
+
+            const body = [
+              `## Terraform Plan — \`${workspace}\``,
+              '',
+              `| Step | Result |`,
+              `| --- | --- |`,
+              `| \`terraform fmt -check\` | ${statusIcon(fmtOutcome)} ${fmtOutcome} |`,
+              `| \`terraform init\` | ${statusIcon(initOutcome)} ${initOutcome} |`,
+              `| \`terraform validate\` | ${statusIcon(validateOutcome)} ${validateOutcome} |`,
+              `| \`terraform plan\` | ${statusIcon(planOutcome)} ${planOutcome} |`,
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```terraform',
+              planOutput,
+              '```',
+              truncated ? '\n> ⚠️ Plan output was truncated to fit the comment size limit.' : '',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const marker = `<!-- terraform-plan:${workspace} -->`;
+            const fullBody = `${marker}\n${body}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+            }
+
+      - name: Fail on Plan Errors
+        if: steps.fmt.outcome != 'success' || steps.init.outcome != 'success' || steps.validate.outcome != 'success' || steps.plan.outcome != 'success'
+        run: |
+          echo "One or more Terraform steps failed. See the plan comment for details."
+          exit 1

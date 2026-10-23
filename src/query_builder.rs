@@ -521,11 +521,11 @@ impl EventQueryBuilder {
         value: Option<&str>,
     ) -> Self {
         let param_str = self.next_param();
-        let clause = match op {
-            FilterOp::In if value.is_some() => {
-                format!("{} IN ({})", column, value.unwrap())
+        let clause = match (op, value) {
+            (FilterOp::In, Some(value)) => {
+                format!("{} IN ({})", column, value)
             }
-            _ => {
+            (op, _) => {
                 format!("{} {} {}", column, op.as_sql(), param_str)
             }
         };

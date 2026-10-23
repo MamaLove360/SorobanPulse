@@ -1,0 +1,72 @@
+name: Stale Claims
+
+# Issue #1173 — release claims on assigned issues after 7 days without
+# activity so other contributors can pick them up. Only assigned issues are
+# processed; unassigned issues and pull requests are never touched.
+
+on:
+  schedule:
+    - cron: '30 1 * * *'   # 01:30 UTC daily
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    name: Release stale claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          include-only-assigned: true
+          days-before-issue-stale: 7
+          days-before-issue-close: -1
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          stale-issue-label: stale
+          exempt-issue-labels: 'pinned,priority: critical'
+          remove-issue-stale-when-updated: true
+          stale-issue-message: >
+            This issue has been assigned for 7 days with no activity, so the
+            claim has been released and the issue is open for anyone to pick
+            up. If you are still working on it, comment with a progress update
+            and ask to be re-assigned. See CONTRIBUTING.md → "Claiming an Issue".
+          operations-per-run: 100
+
+  unassign:
+    name: Unassign stale issues
+    needs: stale
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'stale',
+              per_page: 100,
+            });
+            for (const issue of issues) {
+              if (issue.pull_request || issue.assignees.length === 0) continue;
+              await github.rest.issues.removeAssignees({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                assignees: issue.assignees.map(a => a.login),
+              });
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['help wanted'],
+              });
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                name: 'stale',
+              });
+            }

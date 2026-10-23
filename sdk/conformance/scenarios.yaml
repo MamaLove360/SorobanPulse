@@ -315,3 +315,45 @@ scenarios:
       status: 200
       headers:
         content-type: "text/event-stream"
+
+  # ── 15. Verify webhook signature ───────────────────────────────────────────
+  # Reads the webhook sink's /received endpoint and asserts that the
+  # X-Signature-256 header on the most recent delivery matches the expected
+  # HMAC-SHA256 of the raw request body, keyed with the configured secret.
+  #
+  # Runners must:
+  #   1. GET {webhook_sink_url}/received
+  #   2. Take the last entry in the returned array (most recent delivery)
+  #   3. Compute HMAC-SHA256(secret, raw_body) and hex-encode it
+  #   4. Compare against the "X-Signature-256" header value
+  #
+  # The secret is read from the WEBHOOK_SECRET env var (default matches
+  # docker-compose.conformance.yml). The sink URL is read from
+  # WEBHOOK_SINK_URL (default http://localhost:9002).
+  #
+  # This scenario depends on create_subscription having triggered at least
+  # one delivery to the sink.
+  - id: verify_webhook_signature
+    description: "Webhook delivery carries a valid X-Signature-256 HMAC-SHA256 header"
+    method: GET
+    path: /received
+    base_url_env: WEBHOOK_SINK_URL
+    depends_on: create_subscription
+    webhook_signature:
+      secret_env: WEBHOOK_SECRET
+      default_secret: conformance-webhook-secret
+      header: X-Signature-256
+      algorithm: hmac-sha256
+      # The sink returns an array of deliveries; verify the most recent one.
+      delivery_selector: last
+      body_field: body
+      headers_field: headers
+    expect:
+      status: 200
+      body:
+        - op: type
+          field: ""
+          value: array
+        - op: len_gte
+          field: ""
+          value: 1

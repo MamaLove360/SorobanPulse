@@ -5,6 +5,48 @@
 use super::models::{CostEntry, CostForecast, CostTrend};
 use chrono::{DateTime, Duration, Utc};
 
+/// Persist the current hourly cost breakdown into the `cost_snapshots` table.
+///
+/// One row is written per `(snapshot_hour, component, resource_type)` tuple and
+/// existing rows are upserted so repeated calls within the same hour are
+/// idempotent. This lets hourly snapshots survive restarts and be queried by
+/// the admin cost report endpoint.
+///
+/// `breakdown` maps `(component, resource_type)` to the aggregated cost for the
+/// hour. `snapshot_hour` is truncated to the hour boundary before writing.
+pub async fn persist_snapshot(
+    pool: &sqlx::PgPool,
+    snapshot_hour: DateTime<Utc>,
+    breakdown: &std::collections::HashMap<(String, String), f64>,
+) -> Result<(), sqlx::Error> {
+    // Truncate to the top of the hour so all writes within an hour collide.
+    let hour = snapshot_hour
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(snapshot_hour);
+
+    let mut tx = pool.begin().await?;
+    for ((component, resource_type), cost) in breakdown {
+        sqlx::query(
+            r#"
+            INSERT INTO cost_snapshots (snapshot_hour, component, resource_type, cost)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (snapshot_hour, component, resource_type)
+            DO UPDATE SET cost = EXCLUDED.cost
+            "#,
+        )
+        .bind(hour)
+        .bind(component)
+        .bind(resource_type)
+        .bind(*cost)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Generate a cost forecast from a slice of historical cost entries.
 ///
 /// * `entries`       – historical cost records (at least one required)
@@ -29,7 +71,7 @@ pub fn forecast(entries: &[CostEntry], forecast_days: u32) -> Option<CostForecas
 
     // Collect (x, y) points where x is hours since the first bucket.
     let (xs, ys): (Vec<f64>, Vec<f64>) = {
-        let first_hour = *buckets.keys().next().unwrap();
+        let first_hour = buckets.keys().next().copied().unwrap_or_default();
         buckets
             .iter()
             .map(|(&h, &cost)| ((h - first_hour) as f64, cost))
@@ -39,7 +81,7 @@ pub fn forecast(entries: &[CostEntry], forecast_days: u32) -> Option<CostForecas
     let (slope, intercept) = linear_regression(&xs, &ys);
 
     // Project forward from the last observed hour.
-    let last_x = *xs.last().unwrap();
+    let last_x = xs.last().copied().unwrap_or_default();
     let horizon_hours = f64::from(forecast_days) * 24.0;
     let predicted_hourly = (intercept + slope * (last_x + horizon_hours)).max(0.0);
     let predicted_daily = predicted_hourly * 24.0;
@@ -152,5 +194,19 @@ mod tests {
             .collect();
         let f = forecast(&entries, 7).unwrap();
         assert!(matches!(f.trend, CostTrend::Increasing));
+    }
+
+    #[test]
+    fn snapshot_hour_truncation() {
+        // Verify the hour-truncation logic used by persist_snapshot.
+        let now = Utc::now();
+        let hour = now
+            .with_minute(0)
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap();
+        assert_eq!(hour.minute(), 0);
+        assert_eq!(hour.second(), 0);
+        assert_eq!(hour.nanosecond(), 0);
     }
 }

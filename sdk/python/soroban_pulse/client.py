@@ -8,6 +8,7 @@ from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
 from .exceptions import ApiError, AuthenticationError
+from .models import MetaResponse
 
 DEFAULT_BASE_URL = "https://api.sorobanpulse.io/v1"
 DEFAULT_TIMEOUT = 30
@@ -66,6 +67,12 @@ class SorobanPulseClient:
             raise ApiError(exc.code, parsed.get("message", str(exc)), payload=parsed) from exc
         except URLError as exc:
             raise ApiError(0, f"network error: {exc.reason}") from exc
+
+    # -- System -----------------------------------------------------------
+
+    def get_meta(self) -> MetaResponse:
+        """Build metadata and enabled features (``GET /v1/meta``, no auth needed)."""
+        return MetaResponse.from_dict(self._request("GET", "/meta"))
 
     # -- Events -----------------------------------------------------------
 

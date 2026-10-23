@@ -7,6 +7,10 @@ first day.
 
 For deeper environment configuration beyond this day-1 checklist — OS-specific setup, IDE/editor configuration, debugging tools, and performance profiling — see [Development Environment Setup](development-setup.md).
 
+> **In a hurry?** Skip the manual setup below entirely and use the
+> [Dev Container / Codespaces](#dev-container--codespaces) — one click gives you
+> Rust, PostgreSQL, `sqlx-cli`, and a migrated database, with no local installs.
+
 ## Before you start
 
 - **Rust** (stable toolchain — this project does not pin a specific version via
@@ -17,7 +21,9 @@ For deeper environment configuration beyond this day-1 checklist — OS-specific
 
 ## Day-1 checklist
 
-1. **Clone and configure.**
+1. **Clone and configure** — or skip steps 1–3 entirely by opening the repo in a
+   [Dev Container / Codespace](#dev-container--codespaces), which does all of
+   this for you.
    ```bash
    git clone <repo-url> && cd SorobanPulse
    cp .env.example .env   # fill in real values — see README § Setup
@@ -57,6 +63,80 @@ If everything above works, you're set up. If something fails, check
 [Common First-Build Issues](#common-first-build-issues) below before
 [docs/troubleshooting.md](troubleshooting.md), which covers *running* issues
 (indexer lag, rate limiting, SSE) rather than *build* issues.
+
+## Dev Container / Codespaces
+
+The repo ships a [Dev Container](https://containers.dev/) configuration in
+`.devcontainer/`, so you can get a fully working environment without installing
+Rust, PostgreSQL, or `sqlx-cli` on your machine. This is the fastest path for a
+first contribution and the recommended way to try the project.
+
+### Opening the environment
+
+- **GitHub Codespaces:** on the repo page, click **Code → Codespaces → Create
+  codespace on main** (or use the badge/link in the README). The container is
+  built and provisioned automatically.
+- **VS Code locally:** install the
+  [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers),
+  then run **Dev Containers: Reopen in Container** from the command palette
+  (or click the green status-bar button in the bottom-left corner). Docker must
+  be running locally.
+
+The container is based on the `mcr.microsoft.com/devcontainers/rust` image and
+starts PostgreSQL as a Docker Compose service (`.devcontainer/docker-compose.yml`),
+so the database is reachable at `postgres:5432` from inside the container.
+
+### What the post-create script does
+
+On first creation, `postCreateCommand` runs automatically and:
+
+1. Copies `.env.example` to `.env` (if `.env` doesn't already exist) so
+   `DATABASE_URL` and friends are set for the container's Postgres service.
+2. Waits for PostgreSQL to accept connections.
+3. Runs `cargo build` to compile the project (this also warms the dependency
+   cache and validates the compile-time `sqlx::query!` macros).
+4. Runs `sqlx migrate run` to apply all migrations to the dev database.
+5. Seeds the database with sample data so `curl http://localhost:3000/v1/events`
+   returns something useful immediately.
+6. Installs Node dependencies (if the repo has a `package.json`) for any
+   tooling that needs them.
+
+Expect the first build to take **under 5 minutes** on a Codespaces default
+machine; subsequent starts reuse the cached build and are near-instant.
+
+### Running the tests
+
+Inside the container, the same commands from the Day-1 checklist apply:
+
+```bash
+make test        # full test suite
+make test-db     # integration tests against a throwaway database
+```
+
+`make test` is expected to pass out of the box inside the Dev Container — if it
+doesn't, that's a bug worth reporting (see [Feedback](#feedback)).
+
+### Troubleshooting
+
+- **Port already in use (`5432` or `3000`).** Another Postgres or app instance
+  is bound to the port. Stop it (`docker compose down` on the host, or
+  `lsof -i :5432`) and rebuild the container. Inside the container, the app
+  should talk to the Compose Postgres service by hostname (`postgres`), not
+  `localhost`.
+- **Database not ready / `connection refused` during post-create.** The
+  Postgres service can take a few seconds to become healthy on a cold start.
+  Rebuild the container (**Dev Containers: Rebuild Container**) or run the
+  post-create steps manually:
+  ```bash
+  sqlx migrate run
+  cargo build
+  ```
+- **`sqlx` compile errors mentioning `DATABASE_URL`.** The `.env` file is
+  missing or points at the wrong host. Confirm `.env` exists and that
+  `DATABASE_URL` uses the `postgres` service hostname, then re-run
+  `sqlx migrate run && cargo build`.
+- **Stale build after pulling changes.** Run **Dev Containers: Rebuild
+  Container** to re-run the post-create script against the updated repo.
 
 ## Why does `cargo build` need a database?
 
@@ -146,6 +226,12 @@ for the exact grant statement needed.
 - **Understand testing conventions**: [CONTRIBUTING.md](../CONTRIBUTING.md) —
   commit message format, migration naming, fuzzing, mutation testing, and the
   PR checklist.
+- **Keep fuzzed functions `pub`**: the `fuzz/` crate links `soroban_pulse` as
+  an external dependency, so any function a fuzz target calls (for example
+  `handlers::validate_contract_id` / `handlers::validate_tx_hash`) must be
+  `pub`, not `pub(crate)` — otherwise the nightly fuzz job fails to build and
+  is reported as a crash. Regression inputs for fuzz targets live in
+  `tests/fixtures/fuzz_seeds/<target>/` (`fuzz/corpus/` is git-ignored).
 - **Understand performance work**: [Performance Tuning Guide](performance-tuning.md)
   and [Database Configuration Tuning](database-configuration-tuning.md).
 - **Pick a first issue**: look for issues labeled `good first issue` (if none

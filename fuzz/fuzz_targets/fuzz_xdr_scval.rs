@@ -8,7 +8,8 @@
 //! - overflow the stack
 //!
 //! Invariants checked:
-//! 1. `serde_json::from_value::<ScVal>` never panics on arbitrary JSON input.
+//! 1. `decode_scval` never panics on arbitrary JSON input (deep nesting is
+//!    rejected before decoding, issue #1226).
 //! 2. `validate_xdr` never panics on arbitrary input.
 //! 3. Every successfully parsed ScVal can be rendered in every `ScValFormat`
 //!    without panicking.
@@ -24,9 +25,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
-use soroban_pulse::scval_format::{render, ScValFormat};
+use soroban_pulse::scval_format::{decode_scval, render, ScValFormat};
 use soroban_pulse::xdr_validation::{validate_contract_id, validate_tx_hash, validate_xdr};
-use stellar_xdr::curr::ScVal;
 
 fuzz_target!(|data: &[u8]| {
     // ── 1. Parse as JSON Value ────────────────────────────────────────────
@@ -36,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // ── 2. Try to deserialize as ScVal ────────────────────────────────────
-    let sc_val_result = serde_json::from_value::<ScVal>(value.clone());
+    let sc_val_result = decode_scval(&value);
 
     // ── 3. Render in every ScValFormat — must not panic ───────────────────
     for format in [ScValFormat::Json, ScValFormat::Native, ScValFormat::Xdr] {
@@ -57,6 +57,6 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // ── 5. Determinism ────────────────────────────────────────────────────
-    let sc_val_result2: Result<ScVal, _> = serde_json::from_value(value.clone());
-    assert_eq!(sc_val_result.is_ok(), sc_val_result2.is_ok());
+    let sc_val_result2 = decode_scval(&value);
+    assert_eq!(sc_val_result.is_some(), sc_val_result2.is_some());
 });

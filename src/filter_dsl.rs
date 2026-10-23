@@ -666,7 +666,7 @@ fn dsl_filter_store() -> std::sync::MutexGuard<'static, HashMap<String, SavedDsl
     DSL_FILTER_STORE
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
-        .expect("DSL filter store mutex poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // ---------------------------------------------------------------------------

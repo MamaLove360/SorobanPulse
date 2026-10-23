@@ -49,6 +49,10 @@
 [advisories]
 # Treat advisory database as the source of truth
 version = 2
+# Deny known vulnerabilities (CVEs / RUSTSEC advisories)
+vulnerability = "deny"
+# Deny unmaintained crates
+unmaintained = "deny"
 # Ignore advisories for specific crates (if any)
 ignore = []
 # Yanked crate versions are treated as vulnerabilities
@@ -109,6 +113,19 @@ allow = [
 ]
 # Confidence threshold for license detection
 confidence-threshold = 0.8
+# Copyleft licenses that are incompatible with this project's MIT license.
+# Any dependency introducing one of these will fail CI.
+deny = [
+    "GPL-2.0",
+    "GPL-2.0-only",
+    "GPL-2.0-or-later",
+    "GPL-3.0",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "AGPL-3.0",
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
+]
 # Allow crates with specific licenses
 # allow = [
 #     { name = "some-crate", license = "MIT" },

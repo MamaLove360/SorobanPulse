@@ -11,3 +11,9 @@ too-many-arguments-threshold = 8
 
 # Allow long functions in integration-heavy modules (e.g. handlers, indexer).
 too-many-lines-threshold = 120
+
+# Issue #1246: `clippy::unwrap_used` / `clippy::expect_used` are denied in
+# src/ (see the crate attributes in src/lib.rs, src/main.rs and src/bin/*);
+# panicking helpers remain fine inside #[test] / #[cfg(test)] code.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

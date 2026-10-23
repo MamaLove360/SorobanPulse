@@ -417,6 +417,8 @@ mod health_endpoint_tests {
             admin_api_keys: vec![],
             tenant_map: Arc::new(HashMap::new()),
             multi_tenant: false,
+            pool: None,
+            require_auth: false,
         });
         Router::new()
             .route("/health", get(|| async { "OK" }))
@@ -525,6 +527,8 @@ mod unsubscribe_auth_exemption_tests {
             admin_api_keys: vec![],
             tenant_map: Arc::new(HashMap::new()),
             multi_tenant: false,
+            pool: None,
+            require_auth: false,
         });
         Router::new()
             .route("/unsubscribe", get(|| async { "unsubscribed" }))

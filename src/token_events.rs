@@ -26,7 +26,7 @@ pub struct TokenEvent {
     pub amount: Option<String>,
 }
 
-fn topic_str(v: &Value) -> Option<String> {
+pub fn topic_str(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
         Value::Object(m) => m

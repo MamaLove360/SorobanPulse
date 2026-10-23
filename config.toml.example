@@ -46,3 +46,34 @@
 # DASHBOARD_DIR = "web/dist"
 # Extra API origins the dashboard may call (added to its CSP connect-src).
 # DASHBOARD_CONNECT_SRC = ""
+
+# --- Derived metrics DSL (issue #1262) ---
+# User-defined metrics computed from indexed events on a schedule and exposed
+# via the Prometheus /metrics endpoint. Each metric is a [[derived_metrics]]
+# table with the following keys:
+#
+#   name        - Metric name (must be a valid Prometheus identifier).
+#   description - Human-readable help text shown in /metrics.
+#   expression  - The DSL expression used to compute the value.
+#   interval    - Evaluation schedule, e.g. "10s", "1m", "5m".
+#
+# DSL syntax:
+#   - Counters/gauges are referenced by name, e.g. `events_indexed_total`.
+#   - Arithmetic: + - * / and parentheses.
+#   - rate(<counter>, <window>)  -> per-second rate of a counter over a window.
+#   - ratio(<numerator>, <denominator>) -> numerator / denominator (0 if denom is 0).
+#   - sum(<field>) / count(<field>) / unique(<field>) over indexed events.
+#
+# Example 1: indexer throughput in events per second (5-minute window).
+# [[derived_metrics]]
+# name = "indexer_throughput_events_per_second"
+# description = "Indexed events per second over the last 5 minutes"
+# expression = "rate(events_indexed_total, 5m)"
+# interval = "30s"
+#
+# Example 2: RPC error rate as a fraction of total RPC requests.
+# [[derived_metrics]]
+# name = "rpc_error_rate"
+# description = "Fraction of RPC requests that resulted in an error"
+# expression = "ratio(rpc_errors_total, rpc_requests_total)"
+# interval = "1m"

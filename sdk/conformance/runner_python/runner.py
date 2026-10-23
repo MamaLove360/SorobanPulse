@@ -14,6 +14,8 @@ Exit code: 0 = all pass, 1 = one or more failures.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -171,7 +173,43 @@ def check_assertion(body: Any, assertion: AssertionDict) -> str | None:
             return f'field "{field}" expected length >= {expected}, got {len(val)}'
         return None
 
+    if op == "contains":
+        if not found:
+            return f'field "{field}" does not exist'
+        if isinstance(val, str):
+            if not isinstance(expected, str) or expected not in val:
+                return f'field "{field}" expected to contain "{expected}", got "{val}"'
+            return None
+        if isinstance(val, list):
+            if expected not in val:
+                return f'field "{field}" expected to contain {json.dumps(expected)}'
+            return None
+        return f'field "{field}" is not a string or array'
+
     return f'unknown assertion op "{op}"'
+
+
+# ── Webhook signature verification ───────────────────────────────────────────
+
+def verify_webhook_signature(
+    payload: str,
+    signature_header: str,
+    secret: str,
+    timestamp: str | None = None,
+) -> bool:
+    """
+    Verify an HMAC-SHA256 webhook signature in the form ``sha256=<hex>``.
+    When a timestamp is supplied the signed message is ``<timestamp>.<payload>``
+    (Stripe-style scheme); otherwise the raw payload is signed.
+    """
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    provided = signature_header[len("sha256="):].strip()
+    message = f"{timestamp}.{payload}" if timestamp else payload
+    expected = hmac.new(
+        secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, provided)
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -370,6 +408,34 @@ def run_scenario(scenario: ScenarioDict, base_url: str) -> Result:
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
 
+        # ── Webhook signature scenario ───────────────────────────────────────
+        if scenario.get("kind") == "webhook_signature":
+            secret = os.environ.get(
+                scenario.get("secret_env", "CONFORMANCE_WEBHOOK_SECRET"),
+                scenario.get("secret", "conformance-secret"),
+            )
+            payload = scenario.get("payload", '{"event":"test"}')
+            timestamp = scenario.get("timestamp", "1700000000")
+            message = f"{timestamp}.{payload}"
+            signature = "sha256=" + hmac.new(
+                secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+
+            if not verify_webhook_signature(payload, signature, secret, timestamp):
+                errors.append("valid signature was rejected")
+            if verify_webhook_signature(payload + "tampered", signature, secret, timestamp):
+                errors.append("tampered payload was accepted")
+            if verify_webhook_signature(payload, "sha256=deadbeef", secret, timestamp):
+                errors.append("invalid signature was accepted")
+
+            return Result(
+                id=scenario["id"],
+                description=scenario["description"],
+                passed=len(errors) == 0,
+                error="; ".join(errors) or None,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
+
         # ── HTTP scenario ─────────────────────────────────────────────────────
         url = build_url(base_url, resolved_path, scenario.get("query"))
         status, resp_headers, body_text = http_request(
@@ -434,6 +500,29 @@ def print_result(r: Result) -> None:
         print(f"   └─ {r.error}")
 
 
+def to_json_result(r: Result) -> dict[str, Any]:
+    """Normalized result shape shared with the TypeScript and Go runners."""
+    return {
+        "id": r.id,
+        "description": r.description,
+        "passed": r.passed,
+        "error": r.error,
+        "durationMs": r.duration_ms,
+    }
+
+
+def write_json_report(results: list[Result]) -> None:
+    report_path = os.environ.get("CONFORMANCE_REPORT_PATH")
+    if not report_path:
+        return
+    payload = {
+        "sdk": "python",
+        "results": [to_json_result(r) for r in results],
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
 def write_summary(results: list[Result]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -489,6 +578,7 @@ def main() -> int:
     print(f"\n--- Summary ---")
     print(f"Total: {len(all_results)} | Passed: {passed} | Failed: {failed}")
 
+    write_json_report(all_results)
     write_summary(all_results)
 
     return 0 if failed == 0 else 1

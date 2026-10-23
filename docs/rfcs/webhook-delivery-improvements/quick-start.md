@@ -461,7 +461,7 @@ tokio::spawn(run_trace_log_cleanup(pool.clone(), 90));
 → Read: [`spec.md`](spec.md)
 
 ### For Implementation Details
-→ Read: [`implementation-guide.md`](implementation-guide.md)
+→ Read: [`IMPLEMENTATION_GUIDE.md`](../../archive/IMPLEMENTATION_GUIDE.md) (archived)
 
 ### For Testing Strategy
 → Read: [`testing-and-validation.md`](testing-and-validation.md)

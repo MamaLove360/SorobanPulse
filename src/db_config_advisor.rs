@@ -11,7 +11,7 @@
 //! [`docs/database-configuration-tuning.md`] for the full picture, including
 //! the SQLx connection pool settings (`DB_MAX_CONNECTIONS` /
 //! `DB_MIN_CONNECTIONS`), which this module does not cover — see
-//! `crate::pool_management` for that.
+//! `crate::db_pool::management` for that.
 
 use std::fmt;
 

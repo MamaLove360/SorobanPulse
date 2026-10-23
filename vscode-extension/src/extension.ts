@@ -5,6 +5,7 @@ import { ApiEndpoint } from './types';
 import { setApiKey, setAdminApiKey, clearApiKeys, migrateLegacyApiKeys } from './apiKeyManager';
 import { testWebhook } from './webhookTester';
 import { ContractHoverProvider, HOVER_LANGUAGES } from './contractHoverProvider';
+import { SorobanPulseLivePanel } from './livePanel';
 
 export function activate(context: vscode.ExtensionContext): void {
     void migrateLegacyApiKeys(context);
@@ -55,6 +56,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
         // Issue #963: webhook test interface.
         vscode.commands.registerCommand('sorobanpulse.testWebhook', () => testWebhook()),
+
+        // Issue #1316: live event panel.
+        vscode.commands.registerCommand('sorobanpulse.openLivePanel', () => SorobanPulseLivePanel.open(context)),
 
         // Issue #1125: contract ID hover.
         vscode.languages.registerHoverProvider(HOVER_LANGUAGES, contractHover),

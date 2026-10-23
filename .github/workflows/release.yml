@@ -1,9 +1,8 @@
 name: Release
 
 # Runs on every semver tag push (e.g. v1.2.3).
-# Builds the binary and container image, generates CycloneDX + SPDX SBOMs,
-# attests both with SLSA provenance (actions/attest-build-provenance), and
-# uploads everything to the GitHub Release as verifiable artifacts.
+# Builds cross-platform binaries, container image, generates SBOMs,
+# attests with SLSA provenance, creates CHANGELOG, and publishes Helm chart.
 on:
   push:
     tags:
@@ -19,18 +18,123 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  # 1. Build the Rust binary and generate a CycloneDX crate SBOM
+  # 1. Build cross-platform binaries using cargo-dist
   # ─────────────────────────────────────────────────────────────────────────
-  build-binary:
-    name: Build Binary & Crate SBOM
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: soroban-pulse-x86_64-linux
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: soroban-pulse-aarch64-linux
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: soroban-pulse-x86_64-macos
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: soroban-pulse-aarch64-macos
+    outputs:
+      linux-x86-digest: ${{ steps.digest-linux-x86.outputs.sha256 }}
+      linux-arm-digest: ${{ steps.digest-linux-arm.outputs.sha256 }}
+      macos-x86-digest: ${{ steps.digest-macos-x86.outputs.sha256 }}
+      macos-arm-digest: ${{ steps.digest-macos-arm.outputs.sha256 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache Cargo artifacts
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Rename binary
+        run: |
+          cp target/${{ matrix.target }}/release/soroban-pulse ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+
+      - name: Compute binary digest (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        id: digest-linux-x86
+        run: |
+          DIGEST=$(sha256sum ${{ matrix.artifact }} | awk '{ print $1 }')
+          echo "sha256=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute binary digest (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        id: digest-linux-arm
+        run: |
+          DIGEST=$(sha256sum ${{ matrix.artifact }} | awk '{ print $1 }')
+          echo "sha256=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute binary digest (macOS x86_64)
+        if: matrix.target == 'x86_64-apple-darwin'
+        id: digest-macos-x86
+        run: |
+          DIGEST=$(shasum -a 256 ${{ matrix.artifact }} | awk '{ print $1 }')
+          echo "sha256=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute binary digest (macOS ARM64)
+        if: matrix.target == 'aarch64-apple-darwin'
+        id: digest-macos-arm
+        run: |
+          DIGEST=$(shasum -a 256 ${{ matrix.artifact }} | awk '{ print $1 }')
+          echo "sha256=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest binary provenance (SLSA)
+        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669e5 # v2
+        with:
+          subject-path: ${{ matrix.artifact }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ matrix.artifact }}
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Generate crate SBOM (CycloneDX)
+  # ─────────────────────────────────────────────────────────────────────────
+  generate-sbom:
+    name: Generate Crate SBOM
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write       # needed for SLSA attestation signing
-      attestations: write   # needed to write attestation objects
-    outputs:
-      binary-digest: ${{ steps.digest.outputs.sha256 }}
-
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -38,58 +142,11 @@ jobs:
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # Cache the Cargo registry and compiled artefacts to speed up repeat runs.
-      - name: Cache Cargo artefacts
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-release-
-
-      - name: Build release binary
-        run: cargo build --release --locked
-
-      # Compute a stable SHA-256 digest for the binary so we can reference it
-      # in the attestation and in the release notes.
-      - name: Compute binary digest
-        id: digest
-        run: |
-          DIGEST=$(sha256sum target/release/soroban-pulse | awk '{ print $1 }')
-          echo "sha256=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Binary SHA-256: ${DIGEST}"
-
-      # ── CycloneDX SBOM for the Rust crate dependency graph ──────────────
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked --version "^0.5"
 
       - name: Generate CycloneDX crate SBOM
         run: cargo cyclonedx --format json --output-cdx soroban-pulse-sbom.cdx.json
-
-      # ── Attest the binary with SLSA provenance ───────────────────────────
-      - name: Attest binary provenance (SLSA)
-        id: attest-binary
-        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669e5 # v2
-        with:
-          subject-path: target/release/soroban-pulse
-
-      # ── Attest the CycloneDX SBOM ────────────────────────────────────────
-      - name: Attest crate SBOM
-        uses: actions/attest-sbom@bd9c7c7c1a07a7d3a7b3b3b3d3b3c3e3f3a3b3c3 # v2
-        with:
-          subject-path: target/release/soroban-pulse
-          sbom-path: soroban-pulse-sbom.cdx.json
-
-      # Upload both artefacts for the release-publish job to pick up.
-      - name: Upload binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: binary
-          path: target/release/soroban-pulse
-          retention-days: 1
 
       - name: Upload crate SBOM
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -99,7 +156,7 @@ jobs:
           retention-days: 1
 
   # ─────────────────────────────────────────────────────────────────────────
-  # 2. Build the container image and generate an SPDX container SBOM
+  # 3. Build the container image and generate an SPDX container SBOM
   # ─────────────────────────────────────────────────────────────────────────
   build-image:
     name: Build Image & Container SBOM
@@ -107,8 +164,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write       # needed for SLSA attestation signing
-      attestations: write   # needed to write attestation objects
+      id-token: write
+      attestations: write
     outputs:
       image-ref: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
       image-digest: ${{ steps.build.outputs.digest }}
@@ -134,6 +191,10 @@ jobs:
           REGISTRY: ${{ env.REGISTRY }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
 
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Compute image metadata
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
@@ -142,6 +203,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
             type=sha,format=long
 
       - name: Build and push image
@@ -157,7 +219,6 @@ jobs:
           provenance: true
           sbom: true
 
-      # ── SPDX SBOM for the container image ───────────────────────────────
       - name: Generate SPDX container SBOM (syft)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
@@ -165,7 +226,6 @@ jobs:
           format: spdx-json
           output-file: soroban-pulse-container-sbom.spdx.json
 
-      # ── Attest the image with SLSA provenance ────────────────────────────
       - name: Attest image provenance (SLSA)
         uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669e5 # v2
         with:
@@ -173,7 +233,6 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      # ── Attest the container SPDX SBOM ──────────────────────────────────
       - name: Attest container SBOM
         uses: actions/attest-sbom@bd9c7c7c1a07a7d3a7b3b3b3d3b3c3e3f3a3b3c3 # v2
         with:
@@ -190,76 +249,249 @@ jobs:
           retention-days: 1
 
   # ─────────────────────────────────────────────────────────────────────────
-  # 3. Create the GitHub Release and attach all SBOMs + checksums
+  # 4. Sign release artifacts with cosign
   # ─────────────────────────────────────────────────────────────────────────
-  publish-release:
-    name: Publish GitHub Release
-    needs: [build-binary, build-image]
+  sign-artifacts:
+    name: Sign Release Artifacts
+    needs: [build-binaries, build-image]
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # required to create/update GitHub Releases
-
+      contents: read
+      packages: write
+      id-token: write
     steps:
-      - name: Checkout (for release notes)
+      - name: Install cosign
+        uses: sigstore/cosign-installer@main
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+
+      - name: Sign container image
+        run: |
+          cosign sign --yes \
+            ${{ steps.image.outputs.name }}@${{ needs.build-image.outputs.image-digest }}
+
+      - name: Download binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: binaries/
+
+      - name: Sign binaries
+        run: |
+          for binary in binaries/binary-*/soroban-pulse-*; do
+            cosign sign-blob --yes "${binary}" \
+              --output-signature "${binary}.sig" \
+              --output-certificate "${binary}.pem"
+          done
+
+      - name: Upload signatures
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signatures
+          path: |
+            binaries/**/*.sig
+            binaries/**/*.pem
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 5. Generate CHANGELOG from conventional commits using git-cliff
+  # ─────────────────────────────────────────────────────────────────────────
+  generate-changelog:
+    name: Generate CHANGELOG
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - name: Download all artefacts
+      - name: Install git-cliff
+        run: |
+          curl -L https://github.com/orhun/git-cliff/releases/latest/download/git-cliff-$(uname -m)-unknown-linux-gnu.tar.gz | tar -xz
+          sudo mv git-cliff /usr/local/bin/
+
+      - name: Generate changelog for this release
+        run: |
+          git-cliff --latest --strip all -o RELEASE_CHANGELOG.md
+
+      - name: Upload release changelog
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: changelog
+          path: RELEASE_CHANGELOG.md
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 6. Publish Helm chart
+  # ─────────────────────────────────────────────────────────────────────────
+  publish-helm:
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: "3.14.0"
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Chart version
+        run: |
+          sed -i "s/^version:.*/version: ${{ steps.version.outputs.version }}/" helm/soroban-pulse/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.version }}\"/" helm/soroban-pulse/Chart.yaml
+
+      - name: Package Helm chart
+        run: helm package helm/soroban-pulse
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push Helm chart to GHCR
+        run: |
+          helm push soroban-pulse-${{ steps.version.outputs.version }}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 7. Create the GitHub Release and attach all artifacts
+  # ─────────────────────────────────────────────────────────────────────────
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-binaries, build-image, generate-sbom, sign-artifacts, generate-changelog, publish-helm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets/
 
-      # Build a SHA-256 checksum file that covers the binary and both SBOMs.
+      - name: Organize release assets
+        run: |
+          mkdir -p release-files
+          
+          # Move binaries
+          find release-assets/binary-* -type f -name 'soroban-pulse-*' -exec mv {} release-files/ \;
+          
+          # Move signatures
+          find release-assets/signatures -type f \( -name '*.sig' -o -name '*.pem' \) -exec mv {} release-files/ \;
+          
+          # Move SBOMs
+          mv release-assets/crate-sbom/*.json release-files/ || true
+          mv release-assets/container-sbom/*.json release-files/ || true
+          
+          # Move changelog
+          mv release-assets/changelog/RELEASE_CHANGELOG.md release-files/ || true
+
       - name: Generate checksums file
         run: |
-          cd release-assets/
-          find . -type f | sort | xargs sha256sum > SHA256SUMS
+          cd release-files/
+          find . -type f ! -name 'SHA256SUMS' ! -name '*.sig' ! -name '*.pem' ! -name 'RELEASE_CHANGELOG.md' | sort | xargs sha256sum > SHA256SUMS
           cat SHA256SUMS
 
-      # Extract the version from the tag (strips the leading 'v').
       - name: Extract version
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Load release changelog
+        id: changelog
+        run: |
+          if [ -f release-files/RELEASE_CHANGELOG.md ]; then
+            {
+              echo 'notes<<EOF'
+              cat release-files/RELEASE_CHANGELOG.md
+              echo EOF
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo 'notes=' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "SorobanPulse ${{ github.ref_name }}"
-          generate_release_notes: true
           body: |
-            ## Supply-chain artefacts
+            ${{ steps.changelog.outputs.notes }}
 
-            Every release ships verifiable supply-chain artefacts that consumers can use to
-            confirm the binary and container image were produced by this repository.
+            ## Installation
 
-            | Artefact | File |
+            ### Container Image
+
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ```
+
+            ### Binaries
+
+            Download the binary for your platform from the assets below.
+
+            ### Helm Chart
+
+            ```bash
+            helm install soroban-pulse oci://ghcr.io/${{ github.repository_owner }}/charts/soroban-pulse --version ${{ steps.version.outputs.version }}
+            ```
+
+            ## Supply-chain Artifacts
+
+            | Artifact | File |
             |----------|------|
-            | Binary (linux/amd64) | `soroban-pulse` |
-            | Crate dependency SBOM (CycloneDX JSON) | `soroban-pulse-sbom.cdx.json` |
-            | Container SBOM (SPDX JSON) | `soroban-pulse-container-sbom.spdx.json` |
+            | Linux x86_64 binary | `soroban-pulse-x86_64-linux` |
+            | Linux ARM64 binary | `soroban-pulse-aarch64-linux` |
+            | macOS x86_64 binary | `soroban-pulse-x86_64-macos` |
+            | macOS ARM64 binary | `soroban-pulse-aarch64-macos` |
+            | Crate SBOM (CycloneDX) | `soroban-pulse-sbom.cdx.json` |
+            | Container SBOM (SPDX) | `soroban-pulse-container-sbom.spdx.json` |
             | SHA-256 checksums | `SHA256SUMS` |
 
             ### Verification
 
+            **Verify container image signature:**
             ```bash
-            # Verify the binary provenance attestation
-            gh attestation verify soroban-pulse \
-              --repo ${{ github.repository }}
-
-            # Verify the container image provenance attestation
-            gh attestation verify oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }} \
-              --repo ${{ github.repository }}
-
-            # Verify a downloaded file against the checksums
-            sha256sum --check SHA256SUMS
+            cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }} \
+              --certificate-identity=https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }} \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com
             ```
 
-            See [docs/deployment.md](https://github.com/${{ github.repository }}/blob/main/docs/deployment.md#supply-chain-verification)
-            for full verification instructions.
+            **Verify binary provenance:**
+            ```bash
+            gh attestation verify soroban-pulse-x86_64-linux --repo ${{ github.repository }}
+            ```
+
+            **Verify checksums:**
+            ```bash
+            sha256sum --check SHA256SUMS
+            ```
           files: |
-            release-assets/binary/soroban-pulse
-            release-assets/crate-sbom/soroban-pulse-sbom.cdx.json
-            release-assets/container-sbom/soroban-pulse-container-sbom.spdx.json
-            release-assets/SHA256SUMS
+            release-files/soroban-pulse-*
+            release-files/*.sig
+            release-files/*.pem
+            release-files/*.json
+            release-files/SHA256SUMS

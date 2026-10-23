@@ -15,7 +15,7 @@
 //! `run_integrity_scan` never mutates data. Callers decide how to act on a
 //! non-healthy `IntegrityReport` (page an operator, quarantine rows, etc.).
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -23,7 +23,8 @@ use uuid::Uuid;
 
 /// No legitimate Soroban event can predate the Stellar mainnet genesis ledger.
 fn stellar_genesis() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2015, 9, 30, 0, 0, 0).unwrap()
+    // 2015-09-30T00:00:00Z; the constant is always in range.
+    DateTime::from_timestamp(1_443_571_200, 0).unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 /// Timestamps this far beyond "now" are treated as corrupt rather than clock skew.
@@ -358,6 +359,7 @@ pub async fn run_integrity_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use serde_json::json;
 
     fn valid_record<'a>(id: &'a str, event_data: &'a Value) -> EventRecordRef<'a> {

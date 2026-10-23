@@ -336,17 +336,16 @@
           "400": {
             "description": "Invalid query parameters",
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProblemDetail"
                 },
                 "example": {
-                  "error": "unknown event_type: bogus"
+                  "type": "https://soroban-pulse.dev/errors/invalid-query",
+                  "title": "Invalid query parameters",
+                  "status": 400,
+                  "detail": "unknown event_type: bogus",
+                  "instance": "/v1/events"
                 }
               }
             }

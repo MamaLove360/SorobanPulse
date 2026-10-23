@@ -50,6 +50,11 @@ interface Scenario {
   sse_timeout_secs?: number;
   sse_min_events?: number;
   depends_on?: string;
+  // Webhook-signature verification scenario support
+  webhook_signature?: boolean;
+  webhook_secret_env?: string;
+  webhook_sink_env?: string;
+  webhook_timeout_secs?: number;
 }
 
 interface ScenariosFile {
@@ -65,6 +70,18 @@ interface Result {
   passed: boolean;
   error?: string;
   durationMs: number;
+}
+
+/**
+ * Normalized result shape shared across the TypeScript, Python and Go runners.
+ * The CI job diffs the JSON lines emitted by each runner, so the field names
+ * and ordering must stay identical between all three implementations.
+ */
+interface NormalizedResult {
+  scenario: string;
+  passed: boolean;
+  error: string | null;
+  duration_ms: number;
 }
 
 const results: Result[] = [];
@@ -140,6 +157,87 @@ function checkAssertion(body: unknown, assertion: Assertion): string | null {
     default:
       return `unknown assertion op "${(assertion as Assertion).op}"`;
   }
+}
+
+/**
+ * Verify an HMAC-SHA256 webhook signature in constant time.
+ * Mirrors the Python (hmac.compare_digest) and Go (hmac.Equal) runners.
+ */
+function verifyWebhookSignature(
+  secret: string,
+  payload: string,
+  signatureHeader: string
+): boolean {
+  const crypto = require("crypto") as typeof import("crypto");
+  const expected =
+    "sha256=" +
+    crypto.createHmac("sha256", secret).update(payload, "utf8").digest("hex");
+  const a = Buffer.from(expected, "utf8");
+  const b = Buffer.from(signatureHeader.trim(), "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Poll the webhook sink until it receives a delivery, then verify the
+ * signature of the captured payload. The sink is expected to expose
+ * `GET {sink}/last` returning `{ "body": "<raw>", "signature": "<header>" }`.
+ */
+async function runWebhookSignatureScenario(
+  scenario: Scenario,
+  baseUrl: string
+): Promise<{ passed: boolean; error?: string }> {
+  const secretEnv = scenario.webhook_secret_env ?? "WEBHOOK_SECRET";
+  const sinkEnv = scenario.webhook_sink_env ?? "WEBHOOK_SINK_URL";
+  const secret = process.env[secretEnv];
+  const sink = process.env[sinkEnv];
+
+  if (!secret) return { passed: false, error: `missing env ${secretEnv}` };
+  if (!sink) return { passed: false, error: `missing env ${sinkEnv}` };
+
+  const timeoutSecs = scenario.webhook_timeout_secs ?? 15;
+  const deadline = Date.now() + timeoutSecs * 1000;
+
+  let last: { body?: string; signature?: string } | null = null;
+  while (Date.now() < deadline) {
+    try {
+      const res = await makeRequest(
+        buildUrl(sink, "/last"),
+        "GET",
+        {},
+        undefined
+      );
+      if (res.status === 200 && res.body) {
+        const parsed = JSON.parse(res.body) as {
+          body?: string;
+          signature?: string;
+        };
+        if (parsed && typeof parsed.body === "string") {
+          last = parsed;
+          break;
+        }
+      }
+    } catch {
+      // sink not ready yet; keep polling
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  if (!last || typeof last.body !== "string" || !last.signature) {
+    return {
+      passed: false,
+      error: `webhook sink received no delivery within ${timeoutSecs}s`,
+    };
+  }
+
+  if (!verifyWebhookSignature(secret, last.body, last.signature)) {
+    return {
+      passed: false,
+      error: `webhook signature mismatch (header="${last.signature}")`,
+    };
+  }
+
+  return { passed: true };
 }
 
 function buildUrl(
@@ -309,6 +407,21 @@ async function runScenario(
       );
     }
 
+    // ── Webhook-signature scenario ──────────────────────────────────────────
+    if (scenario.webhook_signature) {
+      const { passed, error } = await runWebhookSignatureScenario(
+        scenario,
+        baseUrl
+      );
+      return {
+        id: scenario.id,
+        description: scenario.description,
+        passed,
+        error,
+        durationMs: Date.now() - start,
+      };
+    }
+
     // ── SSE scenario ────────────────────────────────────────────────────────
     if (scenario.sse) {
       const url = buildUrl(baseUrl, resolvedPath, scenario.query);
@@ -433,6 +546,15 @@ async function runScenario(
 
 // ── Output helpers ────────────────────────────────────────────────────────────
 
+function normalize(r: Result): NormalizedResult {
+  return {
+    scenario: r.id,
+    passed: r.passed,
+    error: r.error ?? null,
+    duration_ms: r.durationMs,
+  };
+}
+
 function printResult(r: Result): void {
   const icon = r.passed ? "✅" : "❌";
   const duration = `${r.durationMs}ms`;
@@ -440,6 +562,15 @@ function printResult(r: Result): void {
   if (!r.passed && r.error) {
     console.log(`   └─ ${r.error}`);
   }
+}
+
+/**
+ * Emit the normalized JSON result line. The CI job greps for the
+ * `CONFORMANCE_RESULT` prefix and diffs the payloads across SDKs, so the
+ * prefix and JSON shape must match the Python and Go runners exactly.
+ */
+function emitNormalized(r: Result): void {
+  console.log(`CONFORMANCE_RESULT ${JSON.stringify(normalize(r))}`);
 }
 
 function writeSummary(results: Result[], sdk: string): void {
@@ -451,7 +582,7 @@ function writeSummary(results: Result[], sdk: string): void {
   const total = results.length;
   const badge = failed === 0 ? "🟢" : "🔴";
 
-  let md = `## ${badge} SDK Conformance — TypeScript (${passed}/${total} passed)\n\n`;
+  let md = `## ${badge} SDK Conformance — ${sdk} (${passed}/${total} passed)\n\n`;
   md += `| # | Scenario | Status | Duration | Error |\n`;
   md += `|---|----------|--------|----------|-------|\n`;
   for (const r of results) {
@@ -460,6 +591,14 @@ function writeSummary(results: Result[], sdk: string): void {
     md += `| | \`${r.id}\` | ${status} | ${r.durationMs}ms | ${error} |\n`;
   }
   md += `\n**Total:** ${total} &nbsp;|&nbsp; **Passed:** ${passed} &nbsp;|&nbsp; **Failed:** ${failed}\n`;
+
+  // Machine-readable block so the CI job can diff normalized results across SDKs.
+  md += `\n<details><summary>Normalized results (JSON)</summary>\n\n`;
+  md += "```json\n";
+  for (const r of results) {
+    md += JSON.stringify(normalize(r)) + "\n";
+  }
+  md += "```\n\n</details>\n";
 
   fs.appendFileSync(summaryPath, md);
 }
@@ -482,6 +621,7 @@ async function main(): Promise<void> {
     const result = await runScenario(scenario, baseUrl);
     results.push(result);
     printResult(result);
+    emitNormalized(result);
   }
 
   const passed = results.filter((r) => r.passed).length;

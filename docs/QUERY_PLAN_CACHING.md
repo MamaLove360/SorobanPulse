@@ -96,15 +96,9 @@ let cache = QueryPlanCache::new(config);
 ### Creating Pool with Plan Cache
 
 ```rust
-let (pool, cache) = create_pool_with_plan_cache(
-    database_url,
-    max_connections,
-    min_connections,
-    statement_timeout_ms,
-    idle_timeout_secs,
-    max_lifetime_secs,
-    test_before_acquire,
-).await?;
+// Pools are always built through `db_pool` (issue #1244).
+let pool = db_pool::connect(&database_url, &db_pool::DbPoolSettings::from_config(&config)).await?;
+let cache = QueryPlanCache::with_defaults();
 ```
 
 ## Performance Metrics

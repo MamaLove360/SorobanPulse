@@ -31,6 +31,8 @@ fn auth_app(api_keys: Vec<String>) -> Router {
         admin_api_keys: vec![],
         tenant_map: Arc::new(HashMap::new()),
         multi_tenant: false,
+        pool: None,
+        require_auth: false,
     });
     Router::new()
         .route("/test", get(|| async { "OK" }))
@@ -50,6 +52,8 @@ fn auth_app_with_admin(api_keys: Vec<String>, admin_keys: Vec<String>) -> Router
         admin_api_keys: admin_keys.clone(),
         tenant_map: Arc::new(HashMap::new()),
         multi_tenant: false,
+        pool: None,
+        require_auth: false,
     });
     Router::new()
         .route("/test", get(|| async { "OK" }))
@@ -77,6 +81,8 @@ fn multitenant_app(api_keys: Vec<String>, tenant_map: HashMap<String, String>) -
         admin_api_keys: vec![],
         tenant_map: Arc::new(tenant_map),
         multi_tenant: true,
+        pool: None,
+        require_auth: false,
     });
     Router::new()
         .route("/test", get(|| async { "OK" }))
@@ -283,6 +289,8 @@ async fn admin_key_accepted_at_regular_gate() {
         admin_api_keys: vec!["admin-key".into()],
         tenant_map: Arc::new(HashMap::new()),
         multi_tenant: false,
+        pool: None,
+        require_auth: false,
     });
     let app = Router::new()
         .route("/test", get(|| async { "OK" }))

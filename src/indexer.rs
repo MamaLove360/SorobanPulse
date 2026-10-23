@@ -6,16 +6,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
-use tracing::{error, info, instrument, span, warn, Level};
+use tracing::{error, info, instrument, span, warn, Instrument, Level};
 
 use crate::{
     bloom_filter::{EventBloomFilter, SessionBloomFilter},
     config::{Config, HealthState, IndexerState},
+    costs::calculator::CostCalculator,
     cursor_expiry_handler::{CursorExpiryBackoff, is_cursor_expiry_error},
     kinesis::KinesisPublisher,
     metrics,
     models::{GetEventsResult, LatestLedgerResult, RpcResponse, SorobanEvent},
     pubsub::PubSubPublisher,
+    rpc_endpoints::{RpcEndpoints, RpcLatencyProbe},
     xdr_validation,
 };
 
@@ -75,70 +77,141 @@ pub struct SorobanRpcClient {
     client: reqwest::Client,
     /// Custom headers injected into every RPC request. Values are never logged.
     headers: reqwest::header::HeaderMap,
-    /// All candidate URLs: primary at index 0, fallbacks at 1..
-    urls: Vec<String>,
-    /// Index of the currently active URL.
-    active_idx: std::sync::atomic::AtomicUsize,
-    /// Per-URL consecutive error count used for deprioritisation.
-    error_counts: Vec<AtomicU64>,
+    /// Candidate endpoints with latency and health tracking (issue #1256).
+    endpoints: Arc<RpcEndpoints>,
+    /// Endpoint that served the last successful request, for failover metrics.
+    active_idx: AtomicUsize,
 }
 
 impl SorobanRpcClient {
-    pub fn new(config: &Config) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(config.rpc_connect_timeout_secs))
-            .timeout(Duration::from_secs(config.rpc_request_timeout_secs))
-            .pool_max_idle_per_host(5)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(60))
-            .build()
-            .expect("Failed to build HTTP client");
+    pub fn new(config: &Config) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(config.rpc_connect_timeout_secs))
+                .timeout(Duration::from_secs(config.rpc_request_timeout_secs))
+                .pool_max_idle_per_host(5)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .tcp_keepalive(Duration::from_secs(60)),
+            "RPC",
+        )?;
 
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in &config.rpc_headers {
             let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .unwrap_or_else(|_| panic!("Invalid RPC header name: {name}"));
-            let header_value = reqwest::header::HeaderValue::from_str(value)
-                .unwrap_or_else(|_| panic!("Invalid RPC header value for '{name}'"));
+                .map_err(|_| {
+                    crate::error::InitError::invalid_config("RPC", format!("invalid header name: {name}"))
+                })?;
+            let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                crate::error::InitError::invalid_config("RPC", format!("invalid header value for '{name}'"))
+            })?;
             headers.insert(header_name, header_value);
         }
 
         let mut urls = vec![config.stellar_rpc_url.clone()];
         urls.extend_from_slice(&config.stellar_rpc_fallback_urls);
-        let n = urls.len();
+        let endpoints = Arc::new(RpcEndpoints::new(urls));
+        metrics::set_rpc_active_endpoint(endpoints.url(0));
 
-        Self {
+        Ok(Self {
             client,
             headers,
-            urls,
-            active_idx: std::sync::atomic::AtomicUsize::new(0),
-            error_counts: (0..n).map(|_| AtomicU64::new(0)).collect(),
-        }
+            endpoints,
+            active_idx: AtomicUsize::new(0),
+        })
     }
 
-    /// Return the URL to use next, applying round-robin failover.
-    /// Updates `active_idx` and emits metrics on failover.
-    fn select_url(&self, last_failed_idx: Option<usize>) -> (&str, usize) {
-        let n = self.urls.len();
-        let current = self.active_idx.load(Ordering::Relaxed);
+    /// Background task that measures endpoint latency and revives
+    /// unavailable endpoints. Spawn it alongside the indexer:
+    /// `tokio::spawn(client.latency_probe().run(shutdown_rx))`.
+    pub fn latency_probe(&self) -> RpcLatencyProbe {
+        RpcLatencyProbe::new(
+            self.client.clone(),
+            self.headers.clone(),
+            Arc::clone(&self.endpoints),
+        )
+    }
 
-        if let Some(failed) = last_failed_idx {
-            // Try the next URL after the failed one.
-            let next = (failed + 1) % n;
-            if next != current {
-                self.active_idx.store(next, Ordering::Relaxed);
-                metrics::record_rpc_failover();
-                metrics::set_rpc_active_endpoint(&self.urls[next]);
-                info!(
-                    from = %self.urls[failed],
-                    to = %self.urls[next],
-                    "RPC failover: switching endpoint"
-                );
+    /// Send one JSON-RPC request to `url`.
+    async fn post_once<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<RpcResponse<T>, String> {
+        let response = self
+            .client
+            .post(url)
+            .headers(self.headers.clone())
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    warn!("RPC request timeout");
+                }
+                e.to_string()
+            })?;
+        response.json().await.map_err(|e| e.to_string())
+    }
+
+    /// Send `body` to each endpoint in latency order until one returns a result.
+    ///
+    /// Transport and decoding failures count towards marking an endpoint
+    /// unavailable. A JSON-RPC error object means the endpoint is reachable,
+    /// so it does not, but the next endpoint is still tried; if every
+    /// endpoint fails, that RPC error message is returned in preference to a
+    /// transport error so callers can still recognise e.g. cursor expiry.
+    async fn call_with_failover<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &'static str,
+        body: &serde_json::Value,
+    ) -> Result<T, String> {
+        let mut rpc_err: Option<String> = None;
+        let mut transport_err = String::from("no RPC endpoint reachable");
+
+        for idx in self.endpoints.candidates() {
+            let url = self.endpoints.url(idx).to_owned();
+            let span = span!(
+                Level::INFO,
+                "rpc_call",
+                rpc.method = method,
+                endpoint = %self.endpoints.label(idx)
+            );
+            match self.post_once::<T>(&url, body).instrument(span).await {
+                Ok(RpcResponse { result: Some(r), .. }) => {
+                    self.endpoints.record_success(idx);
+                    let previous = self.active_idx.swap(idx, Ordering::Relaxed);
+                    if previous != idx {
+                        metrics::record_rpc_failover();
+                        metrics::set_rpc_active_endpoint(&url);
+                        info!(
+                            from = %self.endpoints.label(previous),
+                            to = %self.endpoints.label(idx),
+                            "RPC failover: switching endpoint"
+                        );
+                    }
+                    return Ok(r);
+                }
+                Ok(RpcResponse { error, .. }) => {
+                    metrics::record_rpc_error();
+                    let message = match error {
+                        Some(err) => {
+                            warn!(code = err.code, message = %err.message, endpoint = %self.endpoints.label(idx), "RPC error");
+                            err.message
+                        }
+                        None => "RPC returned no result".to_string(),
+                    };
+                    rpc_err.get_or_insert(message);
+                }
+                Err(e) => {
+                    metrics::record_rpc_error();
+                    warn!(endpoint = %self.endpoints.label(idx), error = %e, method, "RPC request failed");
+                    self.endpoints.record_failure(idx);
+                    transport_err = e;
+                }
             }
-            (&self.urls[next], next)
-        } else {
-            (&self.urls[current], current)
         }
+
+        Err(rpc_err.unwrap_or(transport_err))
     }
 }
 
@@ -150,69 +223,9 @@ impl RpcClient for SorobanRpcClient {
             "id": 1,
             "method": "getLatestLedger"
         });
-
-        let mut last_err = String::new();
-        let n = self.urls.len();
-        let start = self.active_idx.load(Ordering::Relaxed);
-
-        for attempt in 0..n {
-            let idx = (start + attempt) % n;
-            let url = self.urls[idx].clone();
-            let span = span!(Level::INFO, "rpc_get_latest_ledger", url = %url);
-            let send_result = {
-                let _enter = span.enter();
-                self.client
-                    .post(&url)
-                    .headers(self.headers.clone())
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        if e.is_timeout() {
-                            warn!("RPC request timeout");
-                        }
-                        metrics::record_rpc_error();
-                        e.to_string()
-                    })
-            };
-
-            match send_result {
-                Err(e) => {
-                    self.error_counts[idx].fetch_add(1, Ordering::Relaxed);
-                    last_err = e;
-                    self.select_url(Some(idx));
-                    continue;
-                }
-                Ok(response) => {
-                    let resp: RpcResponse<LatestLedgerResult> =
-                        response.json().await.map_err(|e| e.to_string())?;
-                    match resp.result {
-                        Some(r) => {
-                            self.error_counts[idx].store(0, Ordering::Relaxed);
-                            if idx != self.active_idx.load(Ordering::Relaxed) {
-                                self.active_idx.store(idx, Ordering::Relaxed);
-                                metrics::set_rpc_active_endpoint(&url);
-                            }
-                            metrics::update_latest_ledger(r.sequence);
-                            return Ok(r.sequence);
-                        }
-                        None => {
-                            if let Some(err) = resp.error {
-                                warn!(code = err.code, message = %err.message, "RPC error");
-                                metrics::record_rpc_error();
-                                last_err = err.message;
-                            } else {
-                                last_err = "RPC returned no result".to_string();
-                            }
-                            self.error_counts[idx].fetch_add(1, Ordering::Relaxed);
-                            self.select_url(Some(idx));
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(last_err)
+        let r: LatestLedgerResult = self.call_with_failover("getLatestLedger", &body).await?;
+        metrics::update_latest_ledger(r.sequence);
+        Ok(r.sequence)
     }
 
     async fn get_events(
@@ -246,68 +259,7 @@ impl RpcClient for SorobanRpcClient {
             "method": "getEvents",
             "params": params
         });
-
-        let mut last_err = String::new();
-        let n = self.urls.len();
-        let start = self.active_idx.load(Ordering::Relaxed);
-
-        for attempt in 0..n {
-            let idx = (start + attempt) % n;
-            let url = self.urls[idx].clone(); // clone to avoid holding &self borrow across await
-            let span = span!(Level::INFO, "rpc_get_events", url = %url);
-            let result = {
-                let _enter = span.enter();
-                self.client
-                    .post(&url)
-                    .headers(self.headers.clone())
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        if e.is_timeout() {
-                            warn!("RPC request timeout");
-                        }
-                        metrics::record_rpc_error();
-                        e.to_string()
-                    })
-            };
-
-            match result {
-                Err(e) => {
-                    self.error_counts[idx].fetch_add(1, Ordering::Relaxed);
-                    last_err = e;
-                    self.select_url(Some(idx));
-                    continue;
-                }
-                Ok(response) => {
-                    let resp: RpcResponse<GetEventsResult> =
-                        response.json().await.map_err(|e| e.to_string())?;
-                    match resp.result {
-                        Some(r) => {
-                            self.error_counts[idx].store(0, Ordering::Relaxed);
-                            if idx != self.active_idx.load(Ordering::Relaxed) {
-                                self.active_idx.store(idx, Ordering::Relaxed);
-                                metrics::set_rpc_active_endpoint(&url);
-                            }
-                            return Ok(r);
-                        }
-                        None => {
-                            if let Some(err) = resp.error {
-                                warn!(code = err.code, message = %err.message, "RPC error");
-                                metrics::record_rpc_error();
-                                last_err = err.message;
-                            } else {
-                                last_err = "RPC returned no result".to_string();
-                            }
-                            self.error_counts[idx].fetch_add(1, Ordering::Relaxed);
-                            self.select_url(Some(idx));
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(last_err)
+        self.call_with_failover("getEvents", &body).await
     }
 }
 
@@ -322,18 +274,24 @@ pub struct Indexer<R: RpcClient> {
     event_counter: AtomicU64,
     bloom_filter: Option<Arc<EventBloomFilter>>,
     /// Issue #615: session-level bloom filter reset on each new ledger.
-    session_bloom: SessionBloomFilter,
+    /// `None` only if the filter could not be built; the DB unique constraint
+    /// remains the authoritative dedup guard in that case.
+    session_bloom: Option<SessionBloomFilter>,
     kinesis_publisher: Option<Arc<dyn KinesisPublisher>>,
     pubsub_publisher: Option<Arc<dyn PubSubPublisher>>,
     sqs_publisher: Option<Arc<dyn crate::sqs::SqsPublisher>>,
     event_hubs_publisher: Option<Arc<dyn crate::event_hubs::EventHubsPublisher>>,
     sse_ring_buffer: Option<Arc<crate::sse_ring_buffer::SseRingBuffer>>,
+    /// Issue #1264: operational cost calculator for RPC call accounting.
+    cost_calculator: Option<Arc<CostCalculator>>,
     #[cfg(feature = "kafka")]
     kafka_publisher: Option<Arc<dyn crate::kafka::KafkaPublisher>>,
     #[cfg(feature = "kafka")]
     kafka_topic: Option<String>,
     #[cfg(feature = "lua")]
     lua_transformer: Option<Arc<crate::lua_transform::LuaTransformer>>,
+    /// Issue #1254: sha256(network passphrase), used to recognise SAC events.
+    sac_network_id: [u8; 32],
 }
 
 impl<R: RpcClient> Indexer<R> {
@@ -343,6 +301,7 @@ impl<R: RpcClient> Indexer<R> {
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
         rpc_client: R,
     ) -> Self {
+        let sac_network_id = crate::sac::network_id(&crate::sac::network_passphrase(&config.chain_id));
         Self {
             pool,
             rpc_client,
@@ -353,18 +312,22 @@ impl<R: RpcClient> Indexer<R> {
             event_tx: None,
             event_counter: AtomicU64::new(0),
             bloom_filter: None,
-            session_bloom: SessionBloomFilter::new(50_000, 0.001),
+            session_bloom: SessionBloomFilter::new(50_000, 0.001)
+                .map_err(|e| warn!(error = %e, "Session bloom filter disabled"))
+                .ok(),
             kinesis_publisher: None,
             pubsub_publisher: None,
             sqs_publisher: None,
             event_hubs_publisher: None,
             sse_ring_buffer: None,
+            cost_calculator: None,
             #[cfg(feature = "kafka")]
             kafka_publisher: None,
             #[cfg(feature = "kafka")]
             kafka_topic: None,
             #[cfg(feature = "lua")]
             lua_transformer: None,
+            sac_network_id,
         }
     }
 
@@ -414,6 +377,12 @@ impl<R: RpcClient> Indexer<R> {
         publisher: Arc<dyn crate::event_hubs::EventHubsPublisher>,
     ) {
         self.event_hubs_publisher = Some(publisher);
+    }
+
+    /// Issue #1264: attach the operational cost calculator so RPC calls made by
+    /// the indexer are accounted for in cost reports.
+    pub fn set_cost_calculator(&mut self, calculator: Arc<CostCalculator>) {
+        self.cost_calculator = Some(calculator);
     }
 
     /// Set the Kafka publisher and topic for event streaming.
@@ -831,8 +800,22 @@ impl<R: RpcClient> Indexer<R> {
                     return Err(IndexerFetchError::Rpc(msg));
                 }
             };
-            total_rpc_ms += rpc_start.elapsed().as_millis();
+            let rpc_elapsed = rpc_start.elapsed();
+            total_rpc_ms += rpc_elapsed.as_millis();
             total_pages += 1;
+
+            // Issue #1264: account for the successful getEvents RPC call in the
+            // operational cost calculator so it shows up in cost reports.
+            if let Some(ref calculator) = self.cost_calculator {
+                calculator
+                    .record_rpc_call(
+                        "indexer",
+                        "getEvents",
+                        rpc_elapsed.as_millis() as u64,
+                        result.events.len() as u64,
+                    )
+                    .await;
+            }
 
             // Issue #426: Validate RPC response doesn't exceed max page size
             let requested_limit = self.config.rpc_max_events_per_page;
@@ -1152,12 +1135,9 @@ impl<R: RpcClient> Indexer<R> {
         schema_version: i32,
     ) -> Result<u64, anyhow::Error> {
         // Issue #615: session-level bloom filter pre-filter (reset on new ledger)
-        if self.session_bloom.check_and_set(
-            &event.tx_hash,
-            &event.contract_id,
-            &event.event_type,
-            event.ledger,
-        ) {
+        if self.session_bloom.as_ref().is_some_and(|bloom| {
+            bloom.check_and_set(&event.tx_hash, &event.contract_id, &event.event_type, event.ledger)
+        }) {
             return Ok(0);
         }
 
@@ -1277,10 +1257,24 @@ impl<R: RpcClient> Indexer<R> {
         let op_index = ordinal.map(|o| o.op_index);
         let event_index = ordinal.map(|o| o.event_index);
 
-        let result = sqlx::query(
-            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint, event_data_compressed, compression_algo, chain_id, tx_index, op_index, event_index)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-               ON CONFLICT (tx_hash, contract_id, event_type) DO NOTHING"#,
+        // Issue #1254: enrich Stellar Asset Contract events with the
+        // underlying classic asset; NULL for every non-SAC event.
+        let topics = event.topic.as_deref().unwrap_or_default();
+        let sac_asset = crate::sac::detect(&event.contract_id, topics, &self.sac_network_id);
+        let (asset_code, asset_issuer) = match &sac_asset {
+            Some(a) => (Some(a.code.as_str()), a.issuer.as_deref()),
+            None => (None, None),
+        };
+
+        // Issue #1251: typed SEP-41 columns; issue #1250: address index rows.
+        let sep41 = crate::sep41::decode_event_data(&event_data);
+        let addresses = crate::account_events::extract_addresses(&event_data);
+
+        let inserted_id: Option<uuid::Uuid> = sqlx::query_scalar(
+            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint, event_data_compressed, compression_algo, chain_id, tx_index, op_index, event_index, sep41_event_type, sep41_from, sep41_to, sep41_amount, asset_code, asset_issuer)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21::numeric, $22, $23)
+               ON CONFLICT (tx_hash, contract_id, event_type) DO NOTHING
+               RETURNING id"#,
         )
         .bind(&event.contract_id)
         .bind(&event.event_type)
@@ -1299,12 +1293,50 @@ impl<R: RpcClient> Indexer<R> {
         .bind(tx_index)
         .bind(op_index)
         .bind(event_index)
-        .execute(&mut **tx)
+        .bind(sep41.as_ref().map(|e| e.event_type.as_str()))
+        .bind(sep41.as_ref().and_then(|e| e.from.as_deref()))
+        .bind(sep41.as_ref().and_then(|e| e.to.as_deref()))
+        .bind(sep41.as_ref().map(|e| e.amount.as_str()))
+        .bind(asset_code)
+        .bind(asset_issuer)
+        .fetch_optional(&mut **tx)
         .await?;
 
-        let rows = result.rows_affected();
+        if let Some(id) = inserted_id {
+            for (address, position) in &addresses {
+                sqlx::query(
+                    "INSERT INTO event_addresses (event_id, address, position, ledger) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                )
+                .bind(id)
+                .bind(address)
+                .bind(position)
+                .bind(ledger)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+
+        let rows = u64::from(inserted_id.is_some());
         if rows > 0 {
             metrics::record_fingerprint_stored();
+            // Issue #1253: first sighting of a contract queues a spec fetch
+            // (no-op unless AUTO_FETCH_CONTRACT_SPECS is enabled).
+            crate::contract_specs::request_fetch(&event.contract_id);
+            // Issue #1255: record deployments/upgrades in the same
+            // transaction. A savepoint keeps a tracking failure from
+            // aborting the surrounding event inserts.
+            if let Some(deployment) =
+                crate::contract_tracker::parse(&event.contract_id, &event.event_type, topics, &event.value)
+            {
+                let mut savepoint = sqlx::Connection::begin(&mut **tx).await?;
+                match crate::contract_tracker::record(&mut savepoint, &deployment, ledger, timestamp, &event.tx_hash).await {
+                    Ok(_) => savepoint.commit().await?,
+                    Err(e) => {
+                        tracing::warn!(error = %e, contract_id = %deployment.contract_id, "failed to record contract deployment");
+                        savepoint.rollback().await?;
+                    }
+                }
+            }
             // Record in bloom filter after successful insert
             if let Some(ref bloom) = self.bloom_filter {
                 bloom.set(&event.tx_hash, &event.contract_id, &event.event_type);
@@ -1331,6 +1363,26 @@ impl<R: RpcClient> Indexer<R> {
             }
         }
         Ok(rows)
+    }
+}
+
+/// Issue #1252: backfill stores through the live insert path.
+#[async_trait::async_trait]
+impl<R: RpcClient> crate::backfill::EventSink for Indexer<R> {
+    async fn store_events(&self, events: &[SorobanEvent], schema_version: i32) -> Result<u64, String> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let mut inserted = 0;
+        for event in events {
+            inserted += self
+                .store_event_in_tx(&mut tx, event, schema_version)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(inserted)
     }
 }
 
@@ -2007,7 +2059,7 @@ mod tests {
         let mut indexer = Indexer {
             pool: pool.clone(),
             rpc_client: Arc::new(FailingRpcClient),
-            config: Config::from_env(),
+            config: Config::default(),
             shutdown_rx,
             indexer_state: None,
             health_state: None,

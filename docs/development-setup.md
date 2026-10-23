@@ -305,10 +305,10 @@ Other test surfaces available once the basic suite is green:
 
 | Kind | Command | Purpose |
 |------|---------|---------|
-| Property-based tests | `cargo test --features proptest` (see [docs/property-testing.md](property-testing.md)) | Fuzz-style invariant checks over generated inputs |
+| Property-based tests | `cargo test --features proptest` (see [docs/property-based-testing.md](property-based-testing.md)) | Fuzz-style invariant checks over generated inputs |
 | Mutation testing | `cargo mutants` (config in [mutants.toml](../mutants.toml)) | Measures whether tests actually catch injected bugs — see [docs/mutation-testing.md](mutation-testing.md) |
 | Fuzzing | `make fuzz` | Targets input-validation boundaries — see [CONTRIBUTING.md § Fuzzing](../CONTRIBUTING.md#fuzzing) |
-| API contract tests | see [docs/api-contract-testing.md](api-contract-testing.md) | Validates responses against the OpenAPI spec |
+| API contract tests | see [docs/contract-testing.md](contract-testing.md) | Validates responses against the OpenAPI spec |
 | End-to-end | `docker-compose.e2e.yml` | Full stack, black-box HTTP tests |
 
 Run the narrowest suite that covers your change first (`cargo test --lib`, then `make test-db`) rather than the full matrix on every save.

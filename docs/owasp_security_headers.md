@@ -75,20 +75,94 @@ X-Frame-Options: DENY
 
 **Browser support**: All modern browsers
 
+#### Swagger UI (`/docs`) specifics
+
+The Swagger UI page served at `GET /docs` is the only endpoint that needs a
+relaxed CSP, because the UI loads its JavaScript and CSS bundles from the
+`unpkg.com` CDN and injects inline bootstrap scripts/styles:
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';
+```
+
+- `script-src 'self' 'unsafe-inline' https://unpkg.com` – allows the local
+  Swagger initializer, the inline bootstrap script, and the Swagger UI bundle
+  from the CDN. No other third-party script origins are permitted.
+- `style-src 'self' 'unsafe-inline' https://unpkg.com` – allows the Swagger UI
+  stylesheet from the CDN and the inline styles it injects.
+- `img-src 'self' data:` – allows the favicon and inline `data:` images used by
+  the UI.
+- `connect-src 'self'` – the UI may only call the API on the same origin.
+- `frame-ancestors 'none'` – the docs page cannot be framed (clickjacking).
+
+If you self-host the Swagger UI assets instead of using the CDN, drop
+`https://unpkg.com` from `script-src` and `style-src` so only `'self'` (plus
+`'unsafe-inline'` where required) is allowed.
+
+The `/docs` response also carries the following headers:
+
+```
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+```
+
+- `Strict-Transport-Security` forces browsers to use HTTPS for the docs page
+  (and all subdomains) for one year, preventing protocol downgrade attacks.
+- `X-Content-Type-Options: nosniff` stops browsers from MIME-sniffing the HTML
+  and asset responses, so a mislabelled response cannot be executed as script.
+
+#### Verifying the Swagger UI headers
+
+Check the headers with `curl -I`:
+
+```bash
+curl -I https://api.example.com/docs
+```
+
+Expected (abridged) output:
+
+```
+HTTP/2 200
+content-type: text/html; charset=utf-8
+content-security-policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+```
+
+Then confirm the UI still renders: open `https://api.example.com/docs` in a
+browser, check the DevTools console for CSP violations (there should be none),
+and exercise an endpoint via "Try it out".
+
+To scan with OWASP ZAP:
+
+```bash
+# Baseline passive scan of the docs page
+docker run --rm -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+  -t https://api.example.com/docs -I
+
+# Or with a local ZAP install
+zap-cli quick-scan --self-contained https://api.example.com/docs
+```
+
+Review the ZAP report for missing-header alerts (CSP, HSTS,
+`X-Content-Type-Options`) and CSP-related warnings; all should be absent.
+
 ---
 
 ### 4. Strict-Transport-Security (HSTS)
 
 **Purpose**: Enforce HTTPS connections
 
-**Value**: `max-age=31536000; includeSubDomains; preload`
+**Value**: `max-age=31536000; includeSubDomains`
 
 **How it works**:
 - Tells browsers to only use HTTPS for communication with the server
 - `max-age=31536000`: Policy valid for 1 year (in seconds)
 - `includeSubDomains`: Apply policy to all subdomains
-- `preload`: Allow inclusion in browser HSTS preload lists
 - Prevents downgrade attacks and man-in-the-middle attacks
+- Applied to **all** responses, including the Swagger UI at `/docs`
+- `preload` can optionally be appended once the domain is ready for browser
+  preload lists (it is irreversible in practice, so enable it deliberately)
 
 **Browser support**: All modern browsers
 
@@ -96,7 +170,7 @@ X-Frame-Options: DENY
 
 **Example**:
 ```
-Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+Strict-Transport-Security: max-age=31536000; includeSubDomains
 ```
 
 ---
@@ -211,11 +285,35 @@ Look for these headers in the response:
 ```
 X-Content-Type-Options: nosniff
 X-Frame-Options: DENY
-Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+Strict-Transport-Security: max-age=31536000; includeSubDomains
 X-XSS-Protection: 1; mode=block
 Permissions-Policy: ...
 Content-Security-Policy: ...
 Referrer-Policy: no-referrer
+```
+
+### Swagger UI (`/docs`)
+
+```bash
+curl -I https://api.example.com/docs
+```
+
+The docs page must return the Swagger-specific CSP (see
+[Swagger UI specifics](#swagger-ui-docs-specifics)), plus:
+
+```
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+```
+
+### OWASP ZAP
+
+Run a passive baseline scan against the docs page and confirm no
+missing-header or CSP alerts are reported:
+
+```bash
+docker run --rm -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+  -t https://api.example.com/docs -I
 ```
 
 ### Using online tools
@@ -234,7 +332,7 @@ response = requests.get("https://api.example.com/health")
 required_headers = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
-    "Strict-Transport-Security": lambda v: "max-age" in v,
+    "Strict-Transport-Security": lambda v: "max-age=31536000" in v and "includeSubDomains" in v,
     "X-XSS-Protection": "1; mode=block",
     "Permissions-Policy": lambda v: len(v) > 0,
     "Content-Security-Policy": lambda v: len(v) > 0,
@@ -249,6 +347,16 @@ for header, expected_value in required_headers.items():
         assert actual == expected_value, f"{header}: expected {expected_value}, got {actual}"
 
 print("✓ All security headers verified!")
+
+# Swagger UI must allow the CDN and inline assets in its CSP
+docs = requests.get("https://api.example.com/docs")
+csp = docs.headers.get("Content-Security-Policy", "")
+assert "https://unpkg.com" in csp, "Swagger CDN missing from CSP"
+assert "script-src" in csp and "style-src" in csp, "CSP missing script/style directives"
+assert docs.headers.get("X-Content-Type-Options") == "nosniff"
+assert "max-age=31536000" in docs.headers.get("Strict-Transport-Security", "")
+
+print("✓ Swagger UI security headers verified!")
 ```
 
 ## Configuration
@@ -321,13 +429,13 @@ curl -i -v https://api.example.com/health
 
 ## Security Headers Score
 
-A proper security headers configuration can achieve an A grade on [securityheaders.com](https://securityheaders.com/).
+A proper security headers configuration can achieve an A+ grade on [securityheaders.com](https://securityheaders.com/).
 
 Soroban Pulse's header configuration is designed to:
 - ✅ Prevent MIME type sniffing
 - ✅ Prevent clickjacking
-- ✅ Enforce HTTPS
-- ✅ Mitigate XSS attacks
+- ✅ Enforce HTTPS (HSTS `max-age=31536000; includeSubDomains`)
+- ✅ Mitigate XSS attacks (including a CSP tailored to the Swagger UI at `/docs`)
 - ✅ Control browser features
 - ✅ Prevent information leakage
 - ✅ Support legacy browsers

@@ -11,10 +11,20 @@ Auto-generated TypeScript client for the Soroban Pulse API.
 
 ## Installation
 
+### From npm registry
+
 ```bash
-npm install
+npm install @soroban-pulse/sdk
 # or
-yarn install
+yarn add @soroban-pulse/sdk
+```
+
+### From local repository
+
+```bash
+npm install ./sdk/typescript
+# or
+yarn add ./sdk/typescript
 ```
 
 ## Usage

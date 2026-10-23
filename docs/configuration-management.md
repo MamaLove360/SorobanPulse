@@ -47,21 +47,33 @@ warnings in production-like environments (see Validation below).
 
 ## Validation
 
-Issue #997 introduces a unified validation pass in `src/config_validation.rs`
-that runs **before** any other initialization at startup. All errors are
-reported at once so operators see a complete list rather than discovering
-problems one at a time.
+Issue #997 introduces a unified validation pass in `src/config_validation.rs`;
+issue #1247 makes `ConfigBuilder::build()` (in `src/config/builder.rs`) the
+only place it runs. Parse errors collected while reading the environment and
+every semantic check are reported together in one typed `ConfigError`, so
+operators see a complete list rather than discovering problems one at a time.
 
 ```
 [startup]
     │
-    ├─ Load Config (env + file + defaults)
+    ├─ ConfigBuilder::from_env()        (env + file + defaults; parse errors collected)
     │
-    ├─ config_validation::validate(&config)
-    │   ├─ fatal errors  → log ERROR + exit(1)
-    │   └─ warnings      → log WARN, continue
+    ├─ .build()?                        (config_validation::validate, once)
+    │   ├─ any error  → Err(ConfigError) → main exits non-zero
+    │   └─ warnings   → log WARN, continue
     │
     └─ Connect to DB, run migrations, start indexer, ...
+```
+
+Configs can also be assembled in code. The database and RPC sections are
+required at compile time — `build()` does not exist until both are supplied:
+
+```rust
+let config = ConfigBuilder::new()
+    .with_database(DatabaseSettings::new("postgres://localhost/soroban_pulse"))
+    .with_rpc(RpcSettings::new("https://soroban-testnet.stellar.org"))
+    .with_server(ServerSettings { port: 8080, ..ServerSettings::default() })
+    .build()?;
 ```
 
 ### Error vs Warning
@@ -98,7 +110,7 @@ Most configuration takes effect only on restart. The exceptions are:
 
 | Setting | Mechanism |
 |---------|-----------|
-| `AdaptivePoolConfig` fields | `watch::Sender<AdaptivePoolConfig>` in `src/adaptive_pool.rs` — send a new config to the channel |
+| `AdaptivePoolConfig` fields | `watch::Sender<AdaptivePoolConfig>` in `src/db_pool/adaptive.rs` — send a new config to the channel |
 | Feature flags | `GET/PUT /v1/admin/feature-flags` API — takes effect immediately |
 | Indexer pause/resume | `POST /v1/admin/indexer/pause` and `/resume` |
 

@@ -198,9 +198,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(feature = "sqs")]
 fn hmac_sha256(key: &[u8], bytes: &[u8]) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    use hmac::Mac;
+    let mut mac = crate::hmac_util::hmac_sha256(key);
     mac.update(bytes);
     mac.finalize().into_bytes().to_vec()
 }

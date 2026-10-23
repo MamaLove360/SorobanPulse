@@ -1,0 +1,47 @@
+# docker-compose.observability.yml
+#
+# Observability overlay for SorobanPulse.
+# Layer this on top of the base compose file:
+#
+#   docker-compose -f docker-compose.yml -f docker-compose.observability.yml up
+#
+# This adds a Loki log aggregation backend and a Promtail log shipper that
+# scrapes the SorobanPulse container logs and forwards them to Loki.
+# See docs/log-aggregation.md for full setup instructions.
+
+services:
+  loki:
+    image: grafana/loki:2.9.6
+    container_name: sorobanpulse-loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+    networks:
+      - sorobanpulse-observability
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:2.9.6
+    container_name: sorobanpulse-promtail
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      # Promtail needs read access to the Docker container log files.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # Promtail needs the Docker socket to discover containers and labels.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docs/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+    depends_on:
+      - loki
+    networks:
+      - sorobanpulse-observability
+    restart: unless-stopped
+
+volumes:
+  loki-data:
+    driver: local
+
+networks:
+  sorobanpulse-observability:
+    driver: bridge

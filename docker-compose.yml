@@ -35,6 +35,50 @@ services:
       retries: 5
       start_period: 30s
 
+  # Conformance-only app instance: same image as `app` but pointed at the
+  # seeded conformance database and the webhook sink.
+  conformance-app:
+    build: .
+    depends_on:
+      conformance-db:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://soroban:soroban@conformance-db:5432/soroban_pulse
+      STELLAR_RPC_URL: ${STELLAR_RPC_URL:-https://soroban-testnet.stellar.org}
+      START_LEDGER: ${START_LEDGER:-0}
+      PORT: "3000"
+      RUST_LOG: ${RUST_LOG:-info}
+      WEBHOOK_URL: http://webhook-sink:9002/hooks
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-conformance-secret}
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/healthz/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # Conformance-only PostgreSQL instance, seeded from sdk/conformance/seed.sql.
+  conformance-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: soroban
+      POSTGRES_PASSWORD: soroban
+      POSTGRES_DB: soroban_pulse
+    ports:
+      - "5433:5432"
+    volumes:
+      - conformance_pgdata:/var/lib/postgresql/data
+      - ./sdk/conformance/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soroban -d soroban_pulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   prometheus:
     image: prom/prometheus:v2.52.0
     command:
@@ -79,8 +123,55 @@ services:
       timeout: 3s
       retries: 5
 
+  # Webhook sink used by the "verify webhook signature" conformance scenario.
+  webhook-sink:
+    image: python:3.12-alpine
+    command:
+      - "python"
+      - "-c"
+      - |
+        import http.server, json, sys
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length)
+                sys.stdout.write(json.dumps({
+                    'path': self.path,
+                    'headers': dict(self.headers),
+                    'body': body.decode('utf-8', 'replace'),
+                }) + "\n")
+                sys.stdout.flush()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'ok')
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'ok')
+            def log_message(self, *args):
+                pass
+        http.server.HTTPServer(('0.0.0.0', 9002), H).serve_forever()
+    ports:
+      - "9002:9002"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9002/healthz')\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
 volumes:
   pgdata:
   promdata:
   grafanadata:
   redisdata:
+
+# Conformance test stack: used by the `sdk-conformance` CI job.
+# Boots the app, PostgreSQL (seeded from sdk/conformance/seed.sql) and a
+# webhook sink on port 9002. All services expose healthchecks so CI can
+# wait for readiness before running the SDK scenario runners.
+#
+# Usage:
+#   docker compose -f docker-compose.conformance.yml up -d --wait
+#   docker compose -f docker-compose.conformance.yml down -v
+  conformance_pgdata:

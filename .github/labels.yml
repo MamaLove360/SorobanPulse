@@ -1,0 +1,83 @@
+# Label taxonomy (issue #1173). Synced to the repository by
+# .github/workflows/labels.yml — edit here, not in the GitHub UI.
+# See CONTRIBUTING.md "Issue Labels" for when to use each label.
+
+# ── Type ────────────────────────────────────────────────────────────────────
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working
+- name: enhancement
+  color: "a2eeef"
+  description: New feature or improvement
+- name: documentation
+  color: "0075ca"
+  description: Documentation-only change
+
+# ── Contributor entry points ────────────────────────────────────────────────
+- name: good first issue
+  color: "7057ff"
+  description: Small, well-scoped task suitable for a first contribution
+- name: help wanted
+  color: "008672"
+  description: Maintainers welcome outside contributions on this issue
+
+# ── Difficulty ──────────────────────────────────────────────────────────────
+- name: "difficulty: easy"
+  color: "c2e0c6"
+  description: A few hours; little prior knowledge of the codebase needed
+- name: "difficulty: medium"
+  color: "fbca04"
+  description: Touches several modules or needs some domain knowledge
+- name: "difficulty: hard"
+  color: "b60205"
+  description: Cross-cutting change or deep Soroban/Stellar knowledge required
+
+# ── Priority ────────────────────────────────────────────────────────────────
+- name: "priority: critical"
+  color: "e11d21"
+  description: Production-impacting; takes precedence over all other work
+
+# ── Area ────────────────────────────────────────────────────────────────────
+- name: "area: indexer"
+  color: "1d76db"
+  description: Ledger ingestion, event normalisation and backfill
+- name: "area: api"
+  color: "1d76db"
+  description: REST, GraphQL, SSE and WebSocket endpoints
+- name: "area: database"
+  color: "1d76db"
+  description: Schema, migrations and queries
+- name: "area: integrations"
+  color: "1d76db"
+  description: Webhooks, notification channels and message queues
+- name: "area: sdk"
+  color: "1d76db"
+  description: Client SDKs and the CLI
+- name: "area: frontend"
+  color: "1d76db"
+  description: Dashboard, web app and VS Code extension
+- name: "area: infra"
+  color: "1d76db"
+  description: CI, Docker, Helm, Kubernetes and Terraform
+- name: "area: docs"
+  color: "1d76db"
+  description: Guides, runbooks and ADRs
+
+# ── Workflow state ──────────────────────────────────────────────────────────
+- name: stale
+  color: "ededed"
+  description: Claimed issue with no activity; assignee will be released
+- name: pinned
+  color: "ededed"
+  description: Exempt from the stale-claim workflow
+
+# ── Automation ──────────────────────────────────────────────────────────────
+- name: security
+  color: "ee0701"
+  description: Security-relevant change or finding
+- name: fuzzing
+  color: "5319e7"
+  description: Found by or related to fuzz testing
+- name: automated
+  color: "ededed"
+  description: Opened by a workflow

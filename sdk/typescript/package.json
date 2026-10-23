@@ -33,7 +33,8 @@
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "jest",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run test"
   },
   "devDependencies": {
     "@types/jest": "^29.5.0",

@@ -26,7 +26,8 @@ DiscordConfig {
 - `send_with_retry(event, max_retries)` — exponential backoff (1s, 2s, 4s,
   ...) around `send_event_notification`, recording
   `soroban_pulse_discord_failures_total` if every attempt fails.
-- `deliver_discord(client, event)` — fire-and-forget wrapper (3 attempts).
+- `NotificationChannel` — `DiscordClient` implements the shared channel trait
+  (3 attempts); see [notification-channel-interface.md](notification-channel-interface.md).
 
 ## Role mentions (Bot API)
 

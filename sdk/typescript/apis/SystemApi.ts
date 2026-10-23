@@ -14,6 +14,12 @@
 
 
 import * as runtime from '../runtime';
+import type {
+  MetaResponse,
+} from '../models/index';
+import {
+    MetaResponseFromJSON,
+} from '../models/index';
 
 /**
  * 
@@ -52,6 +58,43 @@ export class SystemApi extends runtime.BaseAPI {
      */
     async health(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<void> {
         await this.healthRaw(initOverrides);
+    }
+
+    /**
+     * Creates request options for getMeta without sending the request
+     */
+    async getMetaRequestOpts(): Promise<runtime.RequestOpts> {
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+
+        let urlPath = `/v1/meta`;
+
+        return {
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        };
+    }
+
+    /**
+     * Build metadata and enabled features. Public: no authentication required.
+     */
+    async getMetaRaw(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<MetaResponse>> {
+        const requestOptions = await this.getMetaRequestOpts();
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => MetaResponseFromJSON(jsonValue));
+    }
+
+    /**
+     * Build metadata and enabled features. Public: no authentication required.
+     */
+    async getMeta(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetaResponse> {
+        const response = await this.getMetaRaw(initOverrides);
+        return await response.value();
     }
 
     /**

@@ -122,11 +122,11 @@ fn apply_rate_limit_headers(response: &mut Response<Body>, status: &crate::rate_
         if let (Some(limit), Some(remaining)) = (status.limit_minute, status.remaining_minute) {
             let _ = headers.insert(
                 "X-RateLimit-Limit-Minute",
-                limit.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(limit),
             );
             let _ = headers.insert(
                 "X-RateLimit-Remaining-Minute",
-                remaining.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(remaining),
             );
         }
 
@@ -134,11 +134,11 @@ fn apply_rate_limit_headers(response: &mut Response<Body>, status: &crate::rate_
         if let (Some(limit), Some(remaining)) = (status.limit_hour, status.remaining_hour) {
             let _ = headers.insert(
                 "X-RateLimit-Limit-Hour",
-                limit.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(limit),
             );
             let _ = headers.insert(
                 "X-RateLimit-Remaining-Hour",
-                remaining.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(remaining),
             );
         }
 
@@ -146,11 +146,11 @@ fn apply_rate_limit_headers(response: &mut Response<Body>, status: &crate::rate_
         if let (Some(limit), Some(remaining)) = (status.limit_day, status.remaining_day) {
             let _ = headers.insert(
                 "X-RateLimit-Limit-Day",
-                limit.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(limit),
             );
             let _ = headers.insert(
                 "X-RateLimit-Remaining-Day",
-                remaining.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(remaining),
             );
         }
 
@@ -158,11 +158,11 @@ fn apply_rate_limit_headers(response: &mut Response<Body>, status: &crate::rate_
         if let (Some(limit), Some(remaining)) = (status.limit_month, status.remaining_month) {
             let _ = headers.insert(
                 "X-RateLimit-Limit-Month",
-                limit.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(limit),
             );
             let _ = headers.insert(
                 "X-RateLimit-Remaining-Month",
-                remaining.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(remaining),
             );
         }
 
@@ -170,7 +170,7 @@ fn apply_rate_limit_headers(response: &mut Response<Body>, status: &crate::rate_
         if let Some(reset_at) = status.reset_at {
             let _ = headers.insert(
                 "X-RateLimit-Reset",
-                reset_at.to_string().parse().unwrap(),
+                axum::http::HeaderValue::from(reset_at),
             );
         }
 
@@ -185,7 +185,7 @@ fn apply_rate_limit_headers(response: &mut Response<Body>, status: &crate::rate_
                 let retry_after = (reset_at - now).max(1);
                 let _ = headers.insert(
                     "Retry-After",
-                    retry_after.to_string().parse().unwrap(),
+                    axum::http::HeaderValue::from(retry_after),
                 );
             }
         }

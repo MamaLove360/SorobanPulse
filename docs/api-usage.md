@@ -17,7 +17,8 @@ Substitute your deployed base URL as needed.
 7. [Error handling](#error-handling)
 8. [Server-Sent Events (SSE)](#server-sent-events-sse)
 9. [NDJSON export](#ndjson-export)
-10. [Common curl recipes](#common-curl-recipes)
+10. [Contract resource statistics](#contract-resource-statistics)
+11. [Common curl recipes](#common-curl-recipes)
 
 ---
 
@@ -70,6 +71,59 @@ curl -X POST \
 | Wrong key | `403 Forbidden` |
 | Admin endpoint with regular `API_KEY` | `403 Forbidden` |
 | Correct key | `200 OK` |
+
+### Scoped API keys
+
+For production and multi-tenant deployments, mint per-client keys with
+explicit scopes instead of sharing `API_KEY`. Scoped keys look like
+`sp_<base58>` and are sent the same way as any other key. Only a SHA-256
+hash is stored, so the plaintext is shown **once**, at creation.
+
+| Scope | Grants |
+|---|---|
+| `read:events` | All `GET`/`HEAD` requests (events, contracts, stats, streams) and read-only `POST` queries (`/v1/events/tx/batch`, `/graphql`) |
+| `write:subscriptions` | Creating, updating and deleting subscriptions |
+| `admin` | Everything, including `/v1/admin/*`. Implies every other scope |
+
+Any other mutating request requires `admin`. A key without the scope a route
+needs gets `403 Forbidden` with `{"error": "insufficient scope", "required_scope": "…"}`.
+
+Key management requires `ADMIN_API_KEY` or a key with the `admin` scope —
+even when `ADMIN_API_KEY` is unset, these endpoints never fall open:
+
+```bash
+# Create a key (the response's "key" field is the only time you see it)
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "billing-service", "scopes": ["read:events", "write:subscriptions"]}' \
+     http://localhost:3000/v1/admin/api-keys
+
+# List keys (never includes the plaintext key)
+curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:3000/v1/admin/api-keys
+
+# Revoke a key — rejected from the very next request
+curl -X DELETE -H "Authorization: Bearer $ADMIN_API_KEY" \
+     http://localhost:3000/v1/admin/api-keys/$KEY_ID
+```
+
+Scoped keys are checked against the database on every request (no cache), so
+revocation is immediate. `last_used_at` is refreshed at most once a minute.
+In multi-tenant mode, pass `"tenant_id"` when creating a non-admin key to bind
+it to a tenant.
+
+`API_KEY` and `ADMIN_API_KEY` keep working unchanged. If you only use scoped
+keys, set `REQUIRE_API_KEY=true` so requests without a valid key are rejected
+even when `API_KEY` is unset.
+
+### Capability discovery
+
+`GET /v1/meta` is public (no key, no rate limit) and reports the server's
+compiled features, version, build SHA and API version:
+
+```bash
+curl http://localhost:3000/v1/meta
+# {"features":["classical-crypto","dashboard","default"],"version":"1.0.0","build_sha":"076772f1a2b3","api_version":"v1"}
+```
 
 ---
 
@@ -301,13 +355,53 @@ def get_events(base_url: str, **params):
 
 ## Error handling
 
-All error responses use a consistent JSON envelope:
+All error responses use the [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)
+`application/problem+json` media type:
+
+```
+HTTP/1.1 400 Bad Request
+Content-Type: application/problem+json
+```
 
 ```json
 {
-  "error": "human-readable description"
+  "type": "https://sorobanpulse.dev/errors/invalid-parameter",
+  "title": "Invalid parameter",
+  "status": 400,
+  "detail": "`from_ledger` must not be greater than `to_ledger`",
+  "instance": "/v1/events"
 }
 ```
+
+### Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string (URI) | Stable identifier for the error kind.  Dereferencing it documents the error. |
+| `title` | string | Short, human-readable summary of the error kind (stable per `type`). |
+| `status` | integer | HTTP status code, duplicated in the body for convenience. |
+| `detail` | string | Human-readable explanation specific to this occurrence. |
+| `instance` | string | URI of the request that produced the error (usually the path). |
+
+### `type` URI convention
+
+`type` values are absolute URIs under `https://sorobanpulse.dev/errors/`.
+Clients should branch on `type`, not on `title` or `detail` (which may change
+wording).  Examples:
+
+| `type` | Typical status |
+|---|---|
+| `https://sorobanpulse.dev/errors/invalid-parameter` | `400` |
+| `https://sorobanpulse.dev/errors/unauthorized` | `401` |
+| `https://sorobanpulse.dev/errors/forbidden` | `403` |
+| `https://sorobanpulse.dev/errors/not-found` | `404` |
+| `https://sorobanpulse.dev/errors/validation-failed` | `422` |
+| `https://sorobanpulse.dev/errors/rate-limited` | `429` |
+| `https://sorobanpulse.dev/errors/internal` | `500` |
+| `https://sorobanpulse.dev/errors/unavailable` | `503` |
+
+> Older clients that read the legacy `error` field should migrate to `detail`.
+=======
 
 ### HTTP status codes
 
@@ -331,10 +425,19 @@ HTTP_CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
   "http://localhost:3000/v1/events")
 
 if [ "$HTTP_CODE" -ne 200 ]; then
-  echo "Error $HTTP_CODE: $(jq -r .error /tmp/resp.json)"
+  echo "Error $HTTP_CODE: $(jq -r .detail /tmp/resp.json)"
   exit 1
 fi
 cat /tmp/resp.json
+```
+
+### Parsing problems in Python
+
+```python
+resp = requests.get("http://localhost:3000/v1/events")
+if resp.status_code >= 400:
+    problem = resp.json()  # Content-Type: application/problem+json
+    print(problem["type"], problem["title"], problem.get("detail"))
 ```
 
 ### Retryable vs non-retryable errors
@@ -369,6 +472,73 @@ def get_with_retry(url, max_retries=5):
             print(f"Connection error: {e}. Retrying in {wait}s")
             time.sleep(wait)
     raise RuntimeError(f"Failed after {max_retries} retries")
+```
+
+---
+
+## Idempotency keys
+
+POST endpoints that create resources accept an optional `Idempotency-Key`
+header.  Send a unique value (e.g. a UUID v4) with the request; retrying with
+the **same** key returns the original response instead of creating a duplicate.
+
+```bash
+KEY=$(uuidgen)
+
+# First attempt — creates the subscription
+curl -X POST http://localhost:3000/v1/subscriptions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $KEY" \
+  -d '{"contract_id":"CABC...","event_type":"contract"}'
+
+# Retry after a timeout — same key, same response, no duplicate created
+curl -X POST http://localhost:3000/v1/subscriptions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $KEY" \
+  -d '{"contract_id":"CABC...","event_type":"contract"}'
+```
+
+### Semantics
+
+- **Missing header** — the request is processed normally; no idempotency
+  guarantee is provided.
+- **Same key, same request body** — the cached response (status code and body)
+  is replayed.  Only one resource is created.
+- **Same key, different request body** — rejected with `422 Unprocessable
+  Entity` (the key is already bound to a different request).
+- **TTL** — keys are retained for **24 hours**, after which they are purged and
+  the key may be reused.
+
+### Supported endpoints
+
+| Endpoint | Method |
+|---|---|
+| `/v1/subscriptions` | `POST` |
+| `/v1/webhooks` (webhook registration) | `POST` |
+
+### Retry recipe (Python)
+
+```python
+import uuid, requests
+
+def create_subscription(base_url, api_key, payload, max_retries=5):
+    key = str(uuid.uuid4())  # reuse across retries
+    for attempt in range(max_retries):
+        resp = requests.post(
+            f"{base_url}/v1/subscriptions",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Idempotency-Key": key},
+            timeout=10,
+        )
+        if resp.status_code in (429, 500, 502, 503, 504):
+            time.sleep(min(2 ** attempt, 60))
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError("Failed after retries")
 ```
 
 ---
@@ -476,6 +646,40 @@ Example output:
 {"id":"uuid1","contract_id":"CABC...","event_type":"contract","ledger":1234567,...}
 {"id":"uuid2","contract_id":"CABC...","event_type":"contract","ledger":1234568,...}
 ```
+
+---
+
+## Contract resource statistics
+
+`GET /v1/contracts/{contract_id}/stats` returns per-contract CPU, memory and
+fee aggregates, computed once per transaction (not per event) and refreshed
+hourly:
+
+```bash
+curl -H "X-Api-Key: $API_KEY" http://localhost:3000/v1/contracts/$CONTRACT_ID/stats
+```
+
+```json
+{
+  "contract_id": "CA3D...",
+  "tx_count": 1520,
+  "first_ledger": 51000120,
+  "last_ledger": 51230044,
+  "resource_fee": { "total": 182400000, "avg": 120000.0, "p50": 98000.0, "p95": 310000.0, "max": 902311 },
+  "cpu_insns":    { "total": 7412000000, "avg": 4876315.8, "p50": 4100000.0, "p95": 9800000.0, "max": 24000000 },
+  "mem_bytes":    { "total": 3200000000, "avg": 2105263.2, "p50": 1900000.0, "p95": 4100000.0, "max": 9000000 },
+  "refreshed_at": "2026-10-17T18:00:00Z"
+}
+```
+
+- `resource_fee` is the charged Soroban resource fee in stroops (the declared
+  fee when the transaction meta does not report it).
+- `cpu_insns` is consumed CPU instructions (the declared limit as a fallback).
+- `mem_bytes` requires an RPC with Soroban diagnostic events enabled; it is
+  `null` otherwise.
+- Returns `404` until resource data exists for the contract. Collection is
+  opt-in on the indexer: set `RESOURCE_STATS_ENABLED=true` (one extra
+  `getTransaction` call per new transaction).
 
 ---
 

@@ -298,22 +298,22 @@ impl MockCloudPublisher {
 
     /// Configure the mock to fail with the given message.
     pub fn set_fail(&self, msg: &str) {
-        *self.fail_with.lock().unwrap() = Some(msg.to_string());
+        *self.fail_with.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(msg.to_string());
     }
 
     /// Clear the failure so subsequent publishes succeed.
     pub fn clear_fail(&self) {
-        *self.fail_with.lock().unwrap() = None;
+        *self.fail_with.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Set the health state.
     pub fn set_healthy(&self, h: bool) {
-        *self.healthy.lock().unwrap() = h;
+        *self.healthy.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = h;
     }
 
     /// Return the number of successfully published events.
     pub fn published_count(&self) -> usize {
-        self.published.lock().unwrap().len()
+        self.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 }
 
@@ -324,18 +324,18 @@ impl CloudEventPublisher for MockCloudPublisher {
     }
 
     async fn publish(&self, event: &SorobanEvent) -> Result<(), CloudPublishError> {
-        if let Some(ref msg) = *self.fail_with.lock().unwrap() {
+        if let Some(ref msg) = *self.fail_with.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             return Err(CloudPublishError::ProviderError {
                 provider: self.provider,
                 message: msg.clone(),
             });
         }
-        self.published.lock().unwrap().push(event.clone());
+        self.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(event.clone());
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
-        *self.healthy.lock().unwrap()
+        *self.healthy.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

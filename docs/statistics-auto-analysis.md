@@ -293,6 +293,95 @@ Review actual query plans with statistics:
 EXPLAIN ANALYZE SELECT COUNT(*) FROM events WHERE timestamp > NOW() - INTERVAL '7 days';
 ```
 
+## Top query patterns (Issue #1343)
+
+Run this against `pg_stat_statements` to rank the `events` queries by total
+execution time. The extension must be in `shared_preload_libraries`, and
+you need to run `CREATE EXTENSION IF NOT EXISTS pg_stat_statements;` once.
+
+```sql
+SELECT
+    calls,
+    round(total_exec_time::numeric, 1)            AS total_ms,
+    round(mean_exec_time::numeric, 2)             AS mean_ms,
+    round((100 * total_exec_time / sum(total_exec_time) OVER ())::numeric, 1) AS pct,
+    left(regexp_replace(query, '\s+', ' ', 'g'), 160) AS query
+FROM pg_stat_statements
+WHERE query ILIKE '%FROM events%'
+ORDER BY total_exec_time DESC
+LIMIT 5;
+```
+
+The five normalised patterns below dominate on a typical deployment. They
+come from `src/handlers.rs`, `src/query_builder.rs`, `src/graphql.rs` and
+`benches/db_queries.rs`.
+
+| # | Pattern (normalised) | Endpoint | Index used |
+|---|----------------------|----------|------------|
+| 1 | `… FROM events ORDER BY ledger DESC, id DESC LIMIT $1` | `GET /v1/events` | `idx_events_ledger_desc` |
+| 2 | `… WHERE ledger >= $1 AND ledger <= $2 ORDER BY ledger DESC, id DESC LIMIT $3 OFFSET $4` | `GET /v1/events?from_ledger&to_ledger` | **`idx_events_recent_ledger_id`** (partial) |
+| 3 | `… WHERE event_type = $1 ORDER BY ledger DESC, id DESC LIMIT $2` | `GET /v1/events?event_type=contract\|system` | **`idx_events_contract_ledger_id_partial`** / **`idx_events_system_ledger_id_partial`** |
+| 4 | `… WHERE contract_id = $1 [AND event_type = $2] ORDER BY ledger DESC, id DESC LIMIT $n` | `GET /v1/events/contract/{id}` | `idx_events_contract_type_ledger` |
+| 5 | `… WHERE tx_hash = $1 ORDER BY ledger DESC` | `GET /v1/events/tx/{hash}` | `idx_events_tx_ledger` |
+
+Patterns 2 and 3 previously needed an extra `Sort` node: the full indexes
+are keyed on `ledger` alone, and the `id DESC` tie-breaker was not covered.
+The partial indexes from migration
+`20261022000000_partial_indexes_event_type_ledger.sql` remove that sort and
+cover only the hot subset of rows. See [Database Schema](schema.md#partial-indexes-for-common-filter-combinations-issue-1343).
+
+### Verifying index usage
+
+Run `ANALYZE events;` first so the planner has fresh statistics, then:
+
+```sql
+-- Pattern 2: recent ledger range
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at
+FROM events
+WHERE ledger >= (SELECT MAX(ledger) - 1000 FROM events) AND ledger <= (SELECT MAX(ledger) FROM events)
+ORDER BY ledger DESC, id DESC LIMIT 20;
+
+-- Pattern 3: event_type filter
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, ledger FROM events
+WHERE event_type = 'contract'
+ORDER BY ledger DESC, id DESC LIMIT 20;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, ledger FROM events
+WHERE event_type = 'system'
+ORDER BY ledger DESC, id DESC LIMIT 20;
+```
+
+Expected plan shape: a `Limit` directly above an `Index Scan` (or, on the
+partitioned table, a `Merge Append` of per-partition `Index Scan`s) on the
+partial index, with **no `Sort` node**:
+
+```text
+Limit
+  ->  Merge Append
+        Sort Key: events.ledger DESC, events.id DESC
+        ->  Index Scan using events_2026_10_ledger_id_idx on events_2026_10 events_1
+              Index Cond: (...)
+        ...
+```
+
+> The subqueries in the pattern 2 example stop the planner from proving the
+> predicate `ledger > <threshold>`. To check that the partial index is
+> picked, replace them with literal ledger numbers above the threshold
+> (look up the current threshold with
+> `SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_events_recent_ledger_id';`).
+
+To compare performance before and after the migration, run the benchmark
+on both sides:
+
+```bash
+cargo bench --bench db_queries -- db/get_events_ledger_range --save-baseline before
+sqlx migrate run
+cargo bench --bench db_queries -- db/get_events_ledger_range --baseline before
+```
+
 ## Performance Impact
 
 - **Analysis Duration**: Typically 1-15 seconds depending on table size

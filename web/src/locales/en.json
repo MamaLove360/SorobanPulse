@@ -1,0 +1,59 @@
+{
+  "nav": {
+    "eventExplorer": "Event Explorer",
+    "liveStream": "Live Stream",
+    "status": "Status",
+    "admin": "Admin",
+    "toggleTheme": "Toggle theme"
+  },
+  "eventExplorer": {
+    "title": "Event Explorer",
+    "contractIdPlaceholder": "Contract ID",
+    "eventTypePlaceholder": "Event Type",
+    "fromLedgerPlaceholder": "From Ledger",
+    "toLedgerPlaceholder": "To Ledger",
+    "loading": "Loading...",
+    "error": "Error: {{message}}",
+    "noEvents": "No events found",
+    "id": "ID",
+    "contractId": "Contract ID",
+    "type": "Type",
+    "ledger": "Ledger",
+    "timestamp": "Timestamp",
+    "actions": "Actions",
+    "copyId": "Copy ID"
+  },
+  "status": {
+    "title": "System Status",
+    "indexerHealth": "Indexer Health",
+    "status": "Status",
+    "ready": "Ready",
+    "notReady": "Not Ready",
+    "lag": "Lag (blocks)",
+    "currentLedger": "Current Ledger",
+    "database": "Database",
+    "connectionPool": "Connection Pool",
+    "rpc": "RPC",
+    "errorRate5min": "Error Rate (5min)",
+    "sseConnections": "SSE Connections"
+  },
+  "admin": {
+    "title": "Admin Console",
+    "adminKey": "Admin Key",
+    "authenticate": "Authenticate",
+    "indexerControl": "Indexer Control",
+    "indexerStatus": "Status",
+    "role": "Role",
+    "leader": "Leader",
+    "standby": "Standby",
+    "replicas": "Replicas",
+    "pause": "Pause",
+    "resume": "Resume",
+    "replayTrigger": "Replay Trigger",
+    "fromLedger": "From Ledger",
+    "toLedger": "To Ledger",
+    "dryRun": "Dry Run",
+    "triggerReplay": "Trigger Replay",
+    "lagTimeSeries": "Lag Time Series (last 5 min)"
+  }
+}
