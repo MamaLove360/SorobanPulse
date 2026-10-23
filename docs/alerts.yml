@@ -202,6 +202,27 @@ groups:
           description: "The p99 notification delivery latency for channel {{ $labels.channel }} is {{ $value | humanizeDuration }}. Investigate notification queue depth and downstream webhook/email endpoint health."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/notifications.md"
 
+      # #1328: Notification delivery success rate alert
+      - alert: NotificationDeliverySuccessRateLow
+        expr: |
+          (
+            sum(rate(soroban_pulse_notification_delivery_success_total[5m]))
+            /
+            (
+              sum(rate(soroban_pulse_notification_delivery_success_total[5m]))
+              +
+              sum(rate(soroban_pulse_notification_delivery_failure_total[5m]))
+            )
+          ) < 0.95
+        for: 5m
+        labels:
+          severity: critical
+          component: notifications
+        annotations:
+          summary: "Notification delivery success rate below 95%"
+          description: "Only {{ $value | humanizePercentage }} of notification deliveries succeeded over the last 5 minutes (threshold: 95%). A notification channel may be down; follow the channel failover procedure."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/notifications.md#channel-failover"
+
       # #586: Replica sync monitoring alerts
       - alert: ReplicaLagHigh
         expr: soroban_pulse_replica_replay_lag_seconds > 30
