@@ -18,7 +18,7 @@ struct PaginationParams {
 impl PaginationParams {
     pub fn offset(&self) -> i64 {
         let page = self.page.unwrap_or(1).max(1);
-        (page - 1) * self.limit()
+        (page - 1).saturating_mul(self.limit())
     }
 
     pub fn limit(&self) -> i64 {
@@ -194,6 +194,19 @@ proptest! {
         let params = PaginationParams { page: Some(negative_page), limit };
         // Negative pages should be clamped to 1
         prop_assert_eq!(params.page(), 1);
+    }
+
+    #[test]
+    fn prop_pagination_huge_page_offset_saturates(
+        page in (i64::MAX / 100)..=i64::MAX,
+        limit in limit_strategy()
+    ) {
+        // Boundary found by fuzz_pagination_params: (page - 1) * limit used to
+        // overflow and panic for very large page values.
+        let params = PaginationParams { page: Some(page), limit };
+        let expected = (page - 1).checked_mul(params.limit()).unwrap_or(i64::MAX);
+        prop_assert_eq!(params.offset(), expected);
+        prop_assert!(params.offset() >= 0);
     }
 
     #[test]

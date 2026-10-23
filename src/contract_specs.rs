@@ -116,10 +116,14 @@ pub fn custom_section(wasm: &[u8], name: &str) -> Option<Vec<u8>> {
             break;
         }
         if id == 0 {
-            let mut q = p;
-            let nl = leb(wasm, &mut q)?;
-            if wasm.get(q..q + nl)? == name.as_bytes() {
-                out.extend_from_slice(&wasm[q + nl..end]);
+            // Parse the name within the section bounds only: a name length that
+            // runs past `end` must not be allowed to read (or slice) beyond it.
+            let section = &wasm[p..end];
+            let mut q = 0;
+            let nl = leb(section, &mut q)?;
+            let name_end = q.checked_add(nl)?;
+            if section.get(q..name_end)? == name.as_bytes() {
+                out.extend_from_slice(&section[name_end..]);
                 found = true;
             }
         }
@@ -511,6 +515,21 @@ mod tests {
         assert_eq!(custom_section(&w, "contractspecv0").unwrap(), vec![1, 2, 3]);
         assert!(custom_section(&w, "other").is_none());
         assert!(custom_section(b"not wasm", "contractspecv0").is_none());
+    }
+
+    #[test]
+    fn custom_section_name_past_section_end_does_not_panic() {
+        // Regression for fuzz_contract_spec crash: empty custom section whose
+        // name-length byte lies outside the declared section size.
+        let w = b"\0asm\x01\0\0\0\0\0\0";
+        assert!(custom_section(w, "").is_none());
+        assert!(custom_section(w, "contractspecv0").is_none());
+
+        // Name declared longer than the section it lives in.
+        let mut w = b"\0asm\x01\0\0\0".to_vec();
+        w.extend([0, 1, 14]);
+        w.extend(b"contractspecv0");
+        assert!(custom_section(&w, "contractspecv0").is_none());
     }
 
     #[test]
