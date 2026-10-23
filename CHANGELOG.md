@@ -41,7 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured JSON logging support
 
 ### Changed
+- Split `src/handlers.rs` into `src/handlers/{mod,events,health}.rs`; event and health handlers now live in their own modules and are re-exported unchanged (#1239)
 - Removed `--skip handlers::tests` flag from CI test job to run all tests including handler integration tests
+
+### Fixed
+- `PaginationParams::offset()` no longer overflows (panics) for very large `page` values; the offset saturates instead (#1235)
+- Contract spec WASM parsing (`custom_section`) no longer panics when a custom section's name length runs past the section end (#1237)
+- Nightly testnet soak test: `Cargo.lock` brought in sync with `Cargo.toml` so `cargo build --locked` succeeds; RPC calls retry transient failures (timeouts, 429, 5xx) with exponential backoff; the k6 soak script reports the cause of each failure and every breached threshold (#1238)
 
 ### Deprecated
 - Unversioned routes (`/events`, `/events/{contract_id}`, `/events/tx/{tx_hash}`, `/events/stream`) will be removed in v2.0.0. Use `/v1/` prefixed routes instead.

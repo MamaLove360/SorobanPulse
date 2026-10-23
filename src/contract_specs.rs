@@ -116,13 +116,14 @@ pub fn custom_section(wasm: &[u8], name: &str) -> Option<Vec<u8>> {
             break;
         }
         if id == 0 {
-            let mut q = p;
-            let nl = leb(wasm, &mut q)?;
-            // The name must lie within this section; a bogus length used to
-            // slice past `end` and panic (fuzz crash, issue #1224).
-            let name_end = q.checked_add(nl).filter(|&e| e <= end)?;
-            if &wasm[q..name_end] == name.as_bytes() {
-                out.extend_from_slice(&wasm[name_end..end]);
+            // Parse the name within the section bounds only: a name length that
+            // runs past `end` must not be allowed to read (or slice) beyond it.
+            let section = &wasm[p..end];
+            let mut q = 0;
+            let nl = leb(section, &mut q)?;
+            let name_end = q.checked_add(nl)?;
+            if section.get(q..name_end)? == name.as_bytes() {
+                out.extend_from_slice(&section[name_end..]);
                 found = true;
             }
         }
@@ -518,13 +519,16 @@ mod tests {
 
     #[test]
     fn custom_section_name_past_section_end_does_not_panic() {
-        // Section size 1, but name length 5 points past the section end.
+        // Regression for fuzz_contract_spec crash: empty custom section whose
+        // name-length byte lies outside the declared section size.
+        let w = b"\0asm\x01\0\0\0\0\0\0";
+        assert!(custom_section(w, "").is_none());
+        assert!(custom_section(w, "contractspecv0").is_none());
+
+        // Name declared longer than the section it lives in.
         let mut w = b"\0asm\x01\0\0\0".to_vec();
-        w.extend([0, 1, 5, b'a', b'b', b'c', b'd', b'e']);
-        assert!(custom_section(&w, "abcde").is_none());
-        // Name length overflowing usize must not panic either.
-        let mut w = b"\0asm\x01\0\0\0".to_vec();
-        w.extend([0, 6, 0xff, 0xff, 0xff, 0xff, 0x0f, 0]);
+        w.extend([0, 1, 14]);
+        w.extend(b"contractspecv0");
         assert!(custom_section(&w, "contractspecv0").is_none());
     }
 

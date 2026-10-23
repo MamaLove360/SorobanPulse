@@ -1021,6 +1021,12 @@ mod tests {
         assert_eq!(params(Some(3), Some(10)).offset(), 20);
     }
 
+    #[test]
+    fn page_max_offset_saturates_instead_of_overflowing() {
+        assert_eq!(params(Some(i64::MAX), Some(100)).offset(), i64::MAX);
+        assert_eq!(params(Some(i64::MAX), None).offset(), i64::MAX);
+    }
+
     // Regression test for fuzz crash in fuzz_pagination_params (Issue #1225).
     #[test]
     fn huge_page_offset_saturates_instead_of_overflowing() {
